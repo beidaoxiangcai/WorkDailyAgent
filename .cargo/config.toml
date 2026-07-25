@@ -1,0 +1,17 @@
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+
+# 重要：项目所在目录名含冒号 ":"，会破坏 macOS DYLD_FALLBACK_LIBRARY_PATH
+# （该变量用冒号作分隔符）。把 target 目录指到无特殊字符的路径以绕过该问题。
+# 该路径需已存在（沙箱不允许在 ~/ 下新建顶层目录），故先用 mkdir 预创建。
+[build]
+target-dir = "/Users/chen/wda-target"
