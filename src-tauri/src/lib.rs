@@ -1,4 +1,5 @@
 mod collector;
+mod generator;
 mod merger;
 mod storage;
 
@@ -15,6 +16,54 @@ struct PausedState(Arc<AtomicBool>);
 fn query_events(date: String, state: tauri::State<'_, AppState>) -> Result<Vec<storage::EventRow>, String> {
     let (start_ts, end_ts) = parse_day_range(&date).ok_or_else(|| format!("无效日期: {}", date))?;
     state.storage.query_events(start_ts, end_ts).map_err(|e| e.to_string())
+}
+
+/// 生成今日日报：查当日事件 → 组装 Prompt → 调 LLM（失败降级模板）→ 存 reports 表 → 返回内容
+#[tauri::command]
+async fn generate_daily_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let today = today_str();
+    let (start_ts, end_ts) = parse_day_range(&today)
+        .ok_or_else(|| format!("无效日期: {}", today))?;
+
+    // 查当日事件
+    let events = state
+        .storage
+        .query_events(start_ts, end_ts)
+        .map_err(|e| e.to_string())?;
+
+    if events.is_empty() {
+        return Err("今日无采集事件，请先使用一段时间后再生成日报".to_string());
+    }
+
+    // 生成日报内容
+    let report = generator::generate_daily_report(&events).await;
+
+    // 存入 reports 表
+    let event_ids = serde_json::to_string(
+        &events.iter().map(|e| e.id).collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
+
+    state
+        .storage
+        .save_report("daily", &today, &report.content, &event_ids, report.llm_model.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    log::info!("[generator] 日报已保存，日期={}", today);
+    Ok(report.content)
+}
+
+/// 查询日报/周报列表。type="daily"|"weekly"，可选 date 筛选。
+#[tauri::command]
+fn get_reports(
+    report_type: String,
+    date: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<storage::ReportRow>, String> {
+    state
+        .storage
+        .get_reports(&report_type, date.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 /// 设置采集暂停状态。paused=true 暂停，false 恢复。
@@ -35,6 +84,36 @@ struct AppState {
     storage: storage::Storage,
 }
 
+/// 今天日期字符串 "YYYY-MM-DD"（本地时间，UTC+8）
+fn today_str() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let local = now + 8 * 3600; // UTC+8
+    let days = local / 86400;
+    let remainder = local % 86400;
+    let _hour = remainder / 3600;
+
+    // 反推日期
+    let (y, m, d) = civil_from_days(days);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Unix 天数 → 公历日期（Howard Hinnant civil_from_days）
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (y as i32 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
 /// 把 "YYYY-MM-DD"（本地时间）转为当天的 Unix 秒区间 [start, end)
 fn parse_day_range(date: &str) -> Option<(i64, i64)> {
     let parts: Vec<&str> = date.split('-').collect();
@@ -44,7 +123,6 @@ fn parse_day_range(date: &str) -> Option<(i64, i64)> {
     let y: i32 = parts[0].parse().ok()?;
     let m: u32 = parts[1].parse().ok()?;
     let d: u32 = parts[2].parse().ok()?;
-    // 用 chrono 风格手动算太繁；这里用 time crate 的 days_from_civil 算法（Howard Hinnant）
     let start = days_from_civil(y, m, d) * 86400;
     Some((start, start + 86400))
 }
@@ -88,7 +166,6 @@ pub fn run() {
             let paused_clone = paused.clone();
             tauri::async_runtime::spawn(async move {
                 collector::Collector::new(
-                    // Collector 需要 Storage，但 AppState 也持有一份——这里用一个新连接
                     storage::Storage::open(&db_path).expect("reopen db"),
                     paused_clone,
                 )
@@ -98,7 +175,13 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![query_events, set_paused, is_paused])
+        .invoke_handler(tauri::generate_handler![
+            query_events,
+            set_paused,
+            is_paused,
+            generate_daily_report,
+            get_reports
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

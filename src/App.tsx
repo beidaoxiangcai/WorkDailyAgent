@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import './App.css'
 
-// ── Rust 后端返回的事件结构 ──
+// ── Rust 后端返回的结构 ──
 interface EventRow {
   id: number
   start_ts: number
@@ -11,6 +11,15 @@ interface EventRow {
   bundle_id: string
   window_title: string | null
   duration_ms: number
+}
+
+interface ReportRow {
+  id: number
+  type: string
+  period_date: string
+  generated_at: number
+  content: string
+  llm_model: string | null
 }
 
 // ── 导航项 ──
@@ -31,11 +40,19 @@ function todayStr(): string {
 }
 
 function formatTime(ts: number): string {
-  // 后端存的是 Unix 秒（UTC），按本地时间显示
   const d = new Date(ts * 1000)
   const h = String(d.getHours()).padStart(2, '0')
   const min = String(d.getMinutes()).padStart(2, '0')
   return `${h}:${min}`
+}
+
+function formatDateTime(ts: number): string {
+  const d = new Date(ts * 1000)
+  const mo = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  const h = String(d.getHours()).padStart(2, '0')
+  const min = String(d.getMinutes()).padStart(2, '0')
+  return `${mo}-${day} ${h}:${min}`
 }
 
 function formatDuration(ms: number): string {
@@ -54,6 +71,7 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [paused, setPaused] = useState(false)
+  const [generating, setGenerating] = useState(false)
 
   // 查询当日事件
   const loadEvents = useCallback(async () => {
@@ -81,7 +99,6 @@ function App() {
   useEffect(() => {
     loadEvents()
     loadPaused()
-    // 每 10 秒自动刷新（与后端 flush 周期一致）
     const timer = setInterval(loadEvents, 10000)
     return () => clearInterval(timer)
   }, [loadEvents, loadPaused])
@@ -97,20 +114,40 @@ function App() {
     }
   }
 
+  // 生成今日日报
+  const generateReport = async () => {
+    setGenerating(true)
+    setError(null)
+    try {
+      await invoke<string>('generate_daily_report')
+      // 生成完成后跳转到日报页
+      setPage('reports')
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setGenerating(false)
+    }
+  }
+
   return (
     <div className="layout">
-      {/* 顶部标题栏 */}
       <header className="header">
         <h1>工作日报 Agent</h1>
         <div className="header-right">
           <span className={`status-dot ${paused ? 'paused' : ''}`} />
+          <button
+            className="generate-btn"
+            onClick={generateReport}
+            disabled={generating}
+          >
+            {generating ? '生成中…' : '生成今日日报'}
+          </button>
           <button className="pause-btn" onClick={togglePause}>
             {paused ? '恢复采集' : '暂停采集'}
           </button>
         </div>
       </header>
 
-      {/* 左侧导航 */}
       <nav className="nav">
         {NAV_ITEMS.map((item) => (
           <button
@@ -123,7 +160,6 @@ function App() {
         ))}
       </nav>
 
-      {/* 主内容区 */}
       <main className="main">
         {page === 'timeline' && (
           <TimelinePage
@@ -134,7 +170,7 @@ function App() {
             paused={paused}
           />
         )}
-        {page === 'reports' && <PlaceholderPage text="日报/周报页（S4 实现）" />}
+        {page === 'reports' && <ReportsPage />}
         {page === 'settings' && <PlaceholderPage text="设置页（S5 实现）" />}
       </main>
     </div>
@@ -189,7 +225,96 @@ function TimelinePage({
   )
 }
 
-// ── 占位页（日报/周报、设置） ──
+// ── 日报/周报页 ──
+function ReportsPage() {
+  const [tab, setTab] = useState<'daily' | 'weekly'>('daily')
+  const [reports, setReports] = useState<ReportRow[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [copiedId, setCopiedId] = useState<number | null>(null)
+
+  const loadReports = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const rows = await invoke<ReportRow[]>('get_reports', {
+        reportType: tab,
+      })
+      setReports(rows)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [tab])
+
+  useEffect(() => {
+    loadReports()
+  }, [loadReports])
+
+  const handleCopy = async (report: ReportRow) => {
+    try {
+      await navigator.clipboard.writeText(report.content)
+      setCopiedId(report.id)
+      setTimeout(() => setCopiedId(null), 2000)
+    } catch {
+      // 剪贴板失败时用选中文本兜底
+    }
+  }
+
+  return (
+    <>
+      <div className="reports-tabs">
+        <button
+          className={`tab-btn ${tab === 'daily' ? 'active' : ''}`}
+          onClick={() => setTab('daily')}
+        >
+          日报
+        </button>
+        <button
+          className={`tab-btn ${tab === 'weekly' ? 'active' : ''}`}
+          onClick={() => setTab('weekly')}
+        >
+          周报
+        </button>
+      </div>
+
+      {error && <div className="error-msg">加载失败: {error}</div>}
+      {!error && !loading && reports.length === 0 && (
+        <div className="empty-state">
+          暂无{tab === 'daily' ? '日报' : '周报'}，点击顶栏"生成今日日报"创建
+        </div>
+      )}
+      {!error && reports.length > 0 && (
+        <div className="report-list">
+          {reports.map((r) => (
+            <div className="report-card" key={r.id}>
+              <div className="report-card-header">
+                <span className="report-meta">
+                  {r.period_date} · {formatDateTime(r.generated_at)}
+                </span>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  {r.llm_model && (
+                    <span className="report-model">{r.llm_model}</span>
+                  )}
+                  <button
+                    className={`copy-btn ${copiedId === r.id ? 'copied' : ''}`}
+                    onClick={() => handleCopy(r)}
+                  >
+                    {copiedId === r.id ? '已复制' : '复制'}
+                  </button>
+                </div>
+              </div>
+              <div className="report-content">{r.content}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+// ── 占位页 ──
 function PlaceholderPage({ text }: { text: string }) {
   return <div className="empty-state">{text}</div>
 }

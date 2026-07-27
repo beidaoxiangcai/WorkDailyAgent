@@ -2,7 +2,7 @@
 //!
 //! - WAL 模式：支持并发读 + 高频写无阻塞
 //! - 批量写入：由调用方攒满后一次 flush，减少 IO
-//! - 表结构：events（采集事件）、blacklist（黑名单）
+//! - 表结构：events（采集事件）、blacklist（黑名单）、reports（日报/周报）
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -22,6 +22,18 @@ pub struct EventRow {
     pub bundle_id: String,
     pub window_title: Option<String>,
     pub duration_ms: i64,
+}
+
+/// 查询返回的日报/周报（供前端展示）
+#[derive(Debug, serde::Serialize)]
+pub struct ReportRow {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub report_type: String,
+    pub period_date: String,
+    pub generated_at: i64,
+    pub content: String,
+    pub llm_model: Option<String>,
 }
 
 pub struct Storage {
@@ -58,6 +70,17 @@ impl Storage {
                 app_name   TEXT    NOT NULL,
                 created_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS reports (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                type         TEXT    NOT NULL,
+                period_date  TEXT    NOT NULL,
+                generated_at INTEGER NOT NULL,
+                content      TEXT    NOT NULL,
+                event_ids    TEXT,
+                llm_model    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_reports_type_date ON reports(type, period_date);
             ",
         )?;
 
@@ -127,6 +150,61 @@ impl Storage {
         })?;
         rows.collect()
     }
+
+    /// 保存生成的日报/周报
+    pub fn save_report(
+        &self,
+        report_type: &str,
+        period_date: &str,
+        content: &str,
+        event_ids: &str,
+        llm_model: Option<&str>,
+    ) -> rusqlite::Result<i64> {
+        let now = now_secs();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO reports (type, period_date, generated_at, content, event_ids, llm_model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![report_type, period_date, now, content, event_ids, llm_model],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 查询某类型的报告，按生成时间倒序。可选按 period_date 筛选。
+    pub fn get_reports(
+        &self,
+        report_type: &str,
+        period_date: Option<&str>,
+    ) -> rusqlite::Result<Vec<ReportRow>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if period_date.is_some() {
+            "SELECT id, type, period_date, generated_at, content, llm_model
+             FROM reports WHERE type = ?1 AND period_date = ?2
+             ORDER BY generated_at DESC"
+        } else {
+            "SELECT id, type, period_date, generated_at, content, llm_model
+             FROM reports WHERE type = ?1
+             ORDER BY generated_at DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = if let Some(date) = period_date {
+            stmt.query_map(params![report_type, date], map_report_row)?.collect()
+        } else {
+            stmt.query_map(params![report_type], map_report_row)?.collect()
+        };
+        rows
+    }
+}
+
+fn map_report_row(row: &rusqlite::Row) -> rusqlite::Result<ReportRow> {
+    Ok(ReportRow {
+        id: row.get(0)?,
+        report_type: row.get(1)?,
+        period_date: row.get(2)?,
+        generated_at: row.get(3)?,
+        content: row.get(4)?,
+        llm_model: row.get(5)?,
+    })
 }
 
 fn now_secs() -> i64 {
