@@ -71,7 +71,10 @@ async fn call_deepseek(timeline: &str) -> Result<String, String> {
         .map_err(|_| "未设置 DEEPSEEK_API_KEY 环境变量".to_string())?;
 
     let system_prompt = "你是一个工作日报助手。根据用户今日的电脑活动时间线，生成\"今日完成\"部分。\n\
-        要求：按项目或时间组织，2~5 条，精炼自然，突出关键产出。只输出日报内容，不要额外解释。";
+        要求：\n\
+        1. 严格基于时间线中真实出现过的应用名和窗口标题，不得编造、臆测或联想未出现的应用或活动。\n\
+        2. 按项目或时间组织，2~5 条，精炼自然，突出关键产出。\n\
+        3. 只输出日报内容，不要额外解释。";
 
     let user_prompt = format!("用户时间线：\n{}", timeline);
 
@@ -82,7 +85,7 @@ async fn call_deepseek(timeline: &str) -> Result<String, String> {
             { "role": "user", "content": user_prompt },
         ],
         "stream": false,
-        "temperature": 0.3,
+        "temperature": 0,
     });
 
     let client = reqwest::Client::new();
