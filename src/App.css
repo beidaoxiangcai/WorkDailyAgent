@@ -234,3 +234,160 @@
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* ── 正在记录提示 ── */
+.recording-banner {
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-size: 13px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.recording-banner.idle {
+  background: var(--bg-soft);
+  color: var(--text-muted);
+}
+
+/* ── 设置页 ── */
+.settings-section {
+  margin-bottom: 32px;
+}
+.settings-section h2 {
+  font-size: 16px;
+  margin-bottom: 12px;
+}
+.permission-card {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.permission-info p {
+  margin-bottom: 4px;
+  color: var(--text-h);
+  font-weight: 500;
+}
+.permission-info .hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: normal;
+}
+.permission-status {
+  font-size: 13px;
+  padding: 4px 10px;
+  border-radius: 4px;
+}
+.permission-status.granted {
+  color: var(--green);
+  background: rgba(34, 197, 94, 0.1);
+}
+.permission-status.denied {
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.blacklist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.blacklist-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.blacklist-item .app-name {
+  font-weight: 500;
+  color: var(--text-h);
+}
+.blacklist-item .bundle-id {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.delete-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--red);
+}
+.delete-btn:hover {
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.add-blacklist-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.add-blacklist-row input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  background: var(--bg);
+  color: var(--text-h);
+}
+.add-blacklist-row input::placeholder {
+  color: var(--text-muted);
+}
+.add-blacklist-row input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.add-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+}
+.add-btn:hover {
+  opacity: 0.9;
+}
+
+.danger-zone {
+  border: 1px solid var(--red);
+  border-radius: 10px;
+  padding: 16px;
+  background: var(--bg);
+}
+.danger-zone h3 {
+  color: var(--red);
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+.danger-zone p {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+.clear-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  background: var(--red);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+}
+.clear-btn:hover {
+  opacity: 0.9;
+}
+.clear-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

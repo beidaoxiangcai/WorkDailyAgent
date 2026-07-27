@@ -22,6 +22,18 @@ interface ReportRow {
   llm_model: string | null
 }
 
+interface BlacklistRow {
+  id: number
+  bundle_id: string
+  app_name: string
+  created_at: number
+}
+
+interface ActiveAppInfo {
+  app_name: string
+  window_title: string | null
+}
+
 // ── 导航项 ──
 type Page = 'timeline' | 'reports' | 'settings'
 const NAV_ITEMS: { key: Page; label: string }[] = [
@@ -72,8 +84,8 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [paused, setPaused] = useState(false)
   const [generating, setGenerating] = useState(false)
+  const [activeApp, setActiveApp] = useState<ActiveAppInfo | null>(null)
 
-  // 查询当日事件
   const loadEvents = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -87,7 +99,6 @@ function App() {
     }
   }, [])
 
-  // 读取采集暂停状态
   const loadPaused = useCallback(async () => {
     try {
       setPaused(await invoke<boolean>('is_paused'))
@@ -96,14 +107,27 @@ function App() {
     }
   }, [])
 
+  // 轮询当前活跃应用（供"正在记录"展示）
+  const loadActiveApp = useCallback(async () => {
+    try {
+      setActiveApp(await invoke<ActiveAppInfo | null>('get_active_app_info'))
+    } catch {
+      // ignore
+    }
+  }, [])
+
   useEffect(() => {
     loadEvents()
     loadPaused()
-    const timer = setInterval(loadEvents, 10000)
-    return () => clearInterval(timer)
-  }, [loadEvents, loadPaused])
+    loadActiveApp()
+    const eventTimer = setInterval(loadEvents, 10000)
+    const activeTimer = setInterval(loadActiveApp, 3000)
+    return () => {
+      clearInterval(eventTimer)
+      clearInterval(activeTimer)
+    }
+  }, [loadEvents, loadPaused, loadActiveApp])
 
-  // 切换暂停/恢复
   const togglePause = async () => {
     const next = !paused
     try {
@@ -114,13 +138,11 @@ function App() {
     }
   }
 
-  // 生成今日日报
   const generateReport = async () => {
     setGenerating(true)
     setError(null)
     try {
       await invoke<string>('generate_daily_report')
-      // 生成完成后跳转到日报页
       setPage('reports')
     } catch (e) {
       setError(String(e))
@@ -168,10 +190,11 @@ function App() {
             error={error}
             onRefresh={loadEvents}
             paused={paused}
+            activeApp={activeApp}
           />
         )}
         {page === 'reports' && <ReportsPage />}
-        {page === 'settings' && <PlaceholderPage text="设置页（S5 实现）" />}
+        {page === 'settings' && <SettingsPage />}
       </main>
     </div>
   )
@@ -184,17 +207,31 @@ function TimelinePage({
   error,
   onRefresh,
   paused,
+  activeApp,
 }: {
   events: EventRow[]
   loading: boolean
   error: string | null
   onRefresh: () => void
   paused: boolean
+  activeApp: ActiveAppInfo | null
 }) {
   return (
     <>
+      {/* 正在记录提示 */}
+      {!paused && activeApp && (
+        <div className="recording-banner">
+          <span className="status-dot" />
+          正在记录：{activeApp.app_name}
+          {activeApp.window_title && ` - ${activeApp.window_title}`}
+        </div>
+      )}
+      {paused && (
+        <div className="recording-banner idle">采集已暂停，时间轴不再更新</div>
+      )}
+
       <div className="timeline-header">
-        <h2>今日时间轴 {paused && '· 已暂停'}</h2>
+        <h2>今日时间轴</h2>
         <button className="refresh-btn" onClick={onRefresh} disabled={loading}>
           {loading ? '刷新中…' : '刷新'}
         </button>
@@ -314,9 +351,165 @@ function ReportsPage() {
   )
 }
 
-// ── 占位页 ──
-function PlaceholderPage({ text }: { text: string }) {
-  return <div className="empty-state">{text}</div>
+// ── 设置页 ──
+function SettingsPage() {
+  const [blacklist, setBlacklist] = useState<BlacklistRow[]>([])
+  const [newBundleId, setNewBundleId] = useState('')
+  const [newAppName, setNewAppName] = useState('')
+  const [accessGranted, setAccessGranted] = useState(false)
+  const [clearing, setClearing] = useState(false)
+
+  const loadBlacklist = useCallback(async () => {
+    try {
+      setBlacklist(await invoke<BlacklistRow[]>('get_blacklist'))
+    } catch {
+      // ignore
+    }
+  }, [])
+
+  const loadAccessStatus = useCallback(async () => {
+    try {
+      setAccessGranted(await invoke<boolean>('check_accessibility'))
+    } catch {
+      // ignore
+    }
+  }, [])
+
+  useEffect(() => {
+    loadBlacklist()
+    loadAccessStatus()
+  }, [loadBlacklist, loadAccessStatus])
+
+  const handleAdd = async () => {
+    if (!newBundleId.trim()) return
+    try {
+      await invoke('add_blacklist', {
+        bundleId: newBundleId.trim(),
+        appName: newAppName.trim() || newBundleId.trim(),
+      })
+      setNewBundleId('')
+      setNewAppName('')
+      await loadBlacklist()
+    } catch (e) {
+      alert(`添加失败: ${e}`)
+    }
+  }
+
+  const handleRemove = async (bundleId: string) => {
+    try {
+      await invoke('remove_blacklist', { bundleId })
+      await loadBlacklist()
+    } catch (e) {
+      alert(`删除失败: ${e}`)
+    }
+  }
+
+  const handleOpenSettings = async () => {
+    try {
+      await invoke('open_accessibility_settings')
+    } catch (e) {
+      alert(`打开失败: ${e}`)
+    }
+  }
+
+  const handleClearData = async () => {
+    if (!confirm('确定要清空所有采集事件和日报吗？此操作不可恢复。')) return
+    setClearing(true)
+    try {
+      await invoke('clear_all_data')
+      alert('数据已清空')
+    } catch (e) {
+      alert(`清空失败: ${e}`)
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  return (
+    <>
+      {/* Accessibility 权限引导 */}
+      <div className="settings-section">
+        <h2>辅助功能权限</h2>
+        <div className="permission-card">
+          <div className="permission-info">
+            <p>窗口标题采集</p>
+            <p className="hint">
+              授权后可读取其他应用的窗口标题，仅读标题不读内容
+            </p>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span
+              className={`permission-status ${accessGranted ? 'granted' : 'denied'}`}
+            >
+              {accessGranted ? '已授权' : '未授权'}
+            </span>
+            {!accessGranted && (
+              <button className="add-btn" onClick={handleOpenSettings}>
+                去授权
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* 黑名单管理 */}
+      <div className="settings-section">
+        <h2>黑名单管理</h2>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13, marginBottom: 12 }}>
+          黑名单中的应用不会被采集（如密码管理器、银行 App）
+        </p>
+        <div className="blacklist-list">
+          {blacklist.length === 0 && (
+            <div className="empty-state" style={{ padding: 24 }}>
+              暂无黑名单项
+            </div>
+          )}
+          {blacklist.map((item) => (
+            <div className="blacklist-item" key={item.id}>
+              <div>
+                <div className="app-name">{item.app_name}</div>
+                <div className="bundle-id">{item.bundle_id}</div>
+              </div>
+              <button
+                className="delete-btn"
+                onClick={() => handleRemove(item.bundle_id)}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="add-blacklist-row">
+          <input
+            placeholder="Bundle ID（如 com.apple.Safari）"
+            value={newBundleId}
+            onChange={(e) => setNewBundleId(e.target.value)}
+          />
+          <input
+            placeholder="应用名（可选）"
+            value={newAppName}
+            onChange={(e) => setNewAppName(e.target.value)}
+            style={{ maxWidth: 120 }}
+          />
+          <button className="add-btn" onClick={handleAdd}>
+            添加
+          </button>
+        </div>
+      </div>
+
+      {/* 数据清空 */}
+      <div className="settings-section">
+        <h2>数据管理</h2>
+        <div className="danger-zone">
+          <h3>清空所有数据</h3>
+          <p>删除所有采集事件和已生成的日报/周报，黑名单保留。操作不可恢复。</p>
+          <button className="clear-btn" onClick={handleClearData} disabled={clearing}>
+            {clearing ? '清空中…' : '清空数据'}
+          </button>
+        </div>
+      </div>
+    </>
+  )
 }
 
 export default App

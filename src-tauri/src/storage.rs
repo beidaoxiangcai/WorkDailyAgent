@@ -36,6 +36,15 @@ pub struct ReportRow {
     pub llm_model: Option<String>,
 }
 
+/// 查询返回的黑名单项（供前端展示）
+#[derive(Debug, serde::Serialize)]
+pub struct BlacklistRow {
+    pub id: i64,
+    pub bundle_id: String,
+    pub app_name: String,
+    pub created_at: i64,
+}
+
 pub struct Storage {
     conn: Mutex<Connection>,
 }
@@ -193,6 +202,51 @@ impl Storage {
             stmt.query_map(params![report_type], map_report_row)?.collect()
         };
         rows
+    }
+
+    /// 查询全部黑名单
+    pub fn get_blacklist(&self) -> rusqlite::Result<Vec<BlacklistRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, bundle_id, app_name, created_at FROM blacklist ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(BlacklistRow {
+                id: row.get(0)?,
+                bundle_id: row.get(1)?,
+                app_name: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// 添加黑名单项（bundle_id 唯一，重复时忽略）
+    pub fn add_blacklist(&self, bundle_id: &str, app_name: &str) -> rusqlite::Result<()> {
+        let now = now_secs();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO blacklist (bundle_id, app_name, created_at) VALUES (?1, ?2, ?3)",
+            params![bundle_id, app_name, now],
+        )?;
+        Ok(())
+    }
+
+    /// 删除黑名单项
+    pub fn remove_blacklist(&self, bundle_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM blacklist WHERE bundle_id = ?1", params![bundle_id])?;
+        Ok(())
+    }
+
+    /// 清空所有数据（events + reports），blacklist 保留
+    pub fn clear_all_data(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM events", [])?;
+        tx.execute("DELETE FROM reports", [])?;
+        tx.commit()?;
+        Ok(())
     }
 }
 

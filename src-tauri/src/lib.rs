@@ -79,6 +79,69 @@ fn is_paused(paused_state: tauri::State<'_, PausedState>) -> bool {
     paused_state.0.load(Ordering::Relaxed)
 }
 
+// ── 黑名单管理 ──
+
+/// 查询全部黑名单
+#[tauri::command]
+fn get_blacklist(state: tauri::State<'_, AppState>) -> Result<Vec<storage::BlacklistRow>, String> {
+    state.storage.get_blacklist().map_err(|e| e.to_string())
+}
+
+/// 添加黑名单项
+#[tauri::command]
+fn add_blacklist(bundle_id: String, app_name: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.storage.add_blacklist(&bundle_id, &app_name).map_err(|e| e.to_string())
+}
+
+/// 删除黑名单项
+#[tauri::command]
+fn remove_blacklist(bundle_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.storage.remove_blacklist(&bundle_id).map_err(|e| e.to_string())
+}
+
+// ── 数据清空 ──
+
+/// 清空所有采集事件和日报（blacklist 保留）
+#[tauri::command]
+fn clear_all_data(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.storage.clear_all_data().map_err(|e| e.to_string())
+}
+
+// ── Accessibility 权限 ──
+
+/// 检测 Accessibility 权限状态
+#[tauri::command]
+fn check_accessibility() -> bool {
+    collector::macos::check_accessibility_trusted()
+}
+
+/// 打开系统设置「辅助功能」页（deep link）
+#[tauri::command]
+fn open_accessibility_settings() -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .spawn()
+        .map_err(|e| format!("打开系统设置失败: {}", e))?;
+    Ok(())
+}
+
+// ── 当前活跃应用（供时间轴页"正在记录"展示） ──
+
+/// 获取当前活跃应用名 + 窗口标题
+#[tauri::command]
+fn get_active_app_info() -> Option<ActiveAppInfo> {
+    collector::macos::get_active_app().map(|app| ActiveAppInfo {
+        app_name: app.app_name,
+        window_title: app.window_title,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct ActiveAppInfo {
+    app_name: String,
+    window_title: Option<String>,
+}
+
 /// 持有 Storage 供命令使用
 struct AppState {
     storage: storage::Storage,
@@ -159,6 +222,9 @@ pub fn run() {
             let storage = storage::Storage::open(&db_path)?;
             log::info!("[storage] 数据库已打开: {}", db_path.display());
 
+            // 首次启动时填充默认黑名单（blacklist 表为空才插入）
+            seed_default_blacklist(&storage);
+
             // Storage 注册为 Tauri 状态供命令使用
             app.manage(AppState { storage });
 
@@ -180,8 +246,33 @@ pub fn run() {
             set_paused,
             is_paused,
             generate_daily_report,
-            get_reports
+            get_reports,
+            get_blacklist,
+            add_blacklist,
+            remove_blacklist,
+            clear_all_data,
+            check_accessibility,
+            open_accessibility_settings,
+            get_active_app_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// 首次启动时填充默认黑名单（表为空才插入）
+fn seed_default_blacklist(storage: &storage::Storage) {
+    if let Ok(existing) = storage.get_blacklist() {
+        if !existing.is_empty() {
+            return; // 已有数据，不重复填充
+        }
+    }
+    let defaults = [
+        ("com.agilebits.onepassword-osx", "1Password"),
+        ("com.apple.keychainaccess", "钥匙串访问"),
+        ("com.apple.SecurityAgent", "系统安全代理"),
+    ];
+    for (bundle_id, app_name) in &defaults {
+        let _ = storage.add_blacklist(bundle_id, app_name);
+    }
+    log::info!("[storage] 已填充默认黑名单 {} 项", defaults.len());
 }

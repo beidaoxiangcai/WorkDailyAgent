@@ -16,34 +16,46 @@ use crate::storage::Storage;
 
 pub struct Collector {
     interval_secs: u64,
-    /// S1: 硬编码黑名单 bundle_id（基础版）；S5 改为 SQLite 持久化 + 设置页管理
+    /// 黑名单 bundle_id 列表（从 SQLite 加载，定期刷新）
     blacklist: Vec<String>,
     merger: Merger,
     storage: Storage,
     flush_interval_secs: u64,
+    /// 黑名单刷新间隔（秒）
+    blacklist_refresh_secs: u64,
     /// 共享暂停标志（true = 暂停）
     paused: Arc<AtomicBool>,
 }
 
 impl Collector {
     pub fn new(storage: Storage, paused: Arc<AtomicBool>) -> Self {
-        let blacklist = vec![
-            "com.agilebits.onepassword-osx".to_string(), // 1Password
-            "com.apple.keychainaccess".to_string(),      // 钥匙串访问
-            "com.apple.SecurityAgent".to_string(),       // 系统安全代理
-        ];
         Self {
             interval_secs: 3,
-            blacklist,
+            blacklist: Vec::new(),
             merger: Merger::new(),
             storage,
             flush_interval_secs: 10,
+            blacklist_refresh_secs: 30,
             paused,
+        }
+    }
+
+    /// 从 SQLite 加载黑名单
+    fn reload_blacklist(&mut self) {
+        match self.storage.get_blacklist() {
+            Ok(rows) => {
+                self.blacklist = rows.iter().map(|r| r.bundle_id.clone()).collect();
+                info!("[collector] 黑名单已加载: {} 项", self.blacklist.len());
+            }
+            Err(e) => warn!("[collector] 加载黑名单失败: {}", e),
         }
     }
 
     /// 启动采集循环。在 tauri 的异步运行时（tokio）上跑。
     pub async fn run(mut self) {
+        // 启动时从 SQLite 加载黑名单
+        self.reload_blacklist();
+
         info!(
             "[collector] 采集模块启动 | 轮询间隔={}s | flush 间隔={}s | 黑名单={} 项",
             self.interval_secs,
@@ -63,12 +75,12 @@ impl Collector {
 
         let mut poll_ticker = tokio::time::interval(Duration::from_secs(self.interval_secs));
         let mut flush_ticker = tokio::time::interval(Duration::from_secs(self.flush_interval_secs));
+        let mut blacklist_ticker = tokio::time::interval(Duration::from_secs(self.blacklist_refresh_secs));
 
         loop {
             tokio::select! {
                 _ = poll_ticker.tick() => {
                     if self.paused.load(Ordering::Relaxed) {
-                        // 暂停期间不采集（不更新 merger 状态）
                         continue;
                     }
                     if let Some(raw) = self.poll_once() {
@@ -77,7 +89,6 @@ impl Collector {
                     }
                 }
                 _ = flush_ticker.tick() => {
-                    // 即使暂停也 flush 缓冲中的已闭合事件
                     let events = self.merger.drain_completed();
                     if !events.is_empty() {
                         match self.storage.insert_events(&events) {
@@ -85,6 +96,10 @@ impl Collector {
                             Err(e) => warn!("[storage] 写入失败: {}", e),
                         }
                     }
+                }
+                _ = blacklist_ticker.tick() => {
+                    // 定期重新加载黑名单，使设置页的增删实时生效
+                    self.reload_blacklist();
                 }
             }
         }
