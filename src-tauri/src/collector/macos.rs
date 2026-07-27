@@ -1,7 +1,7 @@
 //! macOS 系统层：读取当前活跃应用 + 窗口标题
 //!
 //! - 应用级（第 1 层）：NSWorkspace.shared.frontmostApplication → app_name / bundle_id / pid
-//! - 窗口标题（第 2 层）：Accessibility API (AXUIElement) 取 kAXTitleAttribute
+//! - 窗口标题（第 2 层）：Accessibility API (AXUIElement) 取 AXWindows[0].AXTitle
 //!
 //! 标题采集需要"辅助功能"权限；未授权或失败时降级为 None，不影响应用级采集。
 
@@ -20,6 +20,9 @@ extern "C" {
     ) -> i32; // AXError：0 = kAXErrorSuccess
     fn AXIsProcessTrusted() -> u8; // macOS Boolean
     fn CFRelease(cf: CFTypeRef);
+    // CFArray 访问（AXWindows 返回 CFArray）
+    fn CFArrayGetCount(array: CFTypeRef) -> isize;
+    fn CFArrayGetValueAtIndex(array: CFTypeRef, idx: isize) -> CFTypeRef;
 }
 
 // CoreGraphics：获取系统空闲时间（自上次键盘/鼠标输入以来的秒数）
@@ -79,23 +82,54 @@ pub fn get_active_app() -> Option<ActiveApp> {
     })
 }
 
-/// 通过 Accessibility API 读取窗口标题；无权限 / 失败返回 None（降级）
+/// 通过 Accessibility API 读取窗口标题：应用元素 → AXWindows[0] → AXTitle。
+/// 无权限 / 失败返回 None（降级）。
 fn get_window_title(pid: i32) -> Option<String> {
     unsafe {
-        let element = AXUIElementCreateApplication(pid);
-        if element.is_null() {
+        let app_element = AXUIElementCreateApplication(pid);
+        if app_element.is_null() {
             return None;
         }
-        let attr = CFString::new("AXTitle");
-        let mut value: CFTypeRef = std::ptr::null();
-        let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-        // element 自己 release；value 若成功返回则是 +1 retain，由 CFString 接管
-        CFRelease(element);
-        if err != 0 || value.is_null() {
+
+        // 第一步：取应用的 AXWindows 属性（返回 CFArray）
+        let windows_attr = CFString::new("AXWindows");
+        let mut windows_value: CFTypeRef = std::ptr::null();
+        let err =
+            AXUIElementCopyAttributeValue(app_element, windows_attr.as_concrete_TypeRef(), &mut windows_value);
+        CFRelease(app_element);
+
+        if err != 0 || windows_value.is_null() {
             return None;
         }
-        // kAXTitleAttribute 的值类型为 CFString
-        let cf_str = CFString::wrap_under_create_rule(value as CFStringRef);
+
+        // 第二步：取第一个窗口元素
+        let count = CFArrayGetCount(windows_value);
+        if count == 0 {
+            CFRelease(windows_value);
+            return None;
+        }
+        let window_element = CFArrayGetValueAtIndex(windows_value, 0);
+        CFRelease(windows_value);
+
+        if window_element.is_null() {
+            return None;
+        }
+
+        // 第三步：取窗口的 AXTitle 属性
+        let title_attr = CFString::new("AXTitle");
+        let mut title_value: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(
+            window_element,
+            title_attr.as_concrete_TypeRef(),
+            &mut title_value,
+        );
+
+        if err != 0 || title_value.is_null() {
+            return None;
+        }
+
+        // AXTitle 的值类型为 CFString，由 CFString 接管（+1 retain）
+        let cf_str = CFString::wrap_under_create_rule(title_value as CFStringRef);
         Some(cf_str.to_string())
     }
 }
