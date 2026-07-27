@@ -31,5 +31,8 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDictionary", "NSEnumerator"] }
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "NSWindow"] }
 
+# S2: SQLite 存储（bundled 编译内置 sqlite3，避免系统库版本问题）
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 [features]
 # 默认 custom-protocol 由 tauri 注入

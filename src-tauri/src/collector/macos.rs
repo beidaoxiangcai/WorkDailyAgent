@@ -22,6 +22,12 @@ extern "C" {
     fn CFRelease(cf: CFTypeRef);
 }
 
+// CoreGraphics：获取系统空闲时间（自上次键盘/鼠标输入以来的秒数）
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(stateID: u32, eventType: u32) -> f64;
+}
+
 pub struct ActiveApp {
     pub app_name: String,
     pub bundle_id: String,
@@ -32,6 +38,16 @@ pub struct ActiveApp {
 /// 检测当前进程是否已获得"辅助功能"权限
 pub fn check_accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
+}
+
+/// 获取系统空闲时间（秒）：自上次键盘/鼠标输入以来经过的时间。
+/// 用于空闲检测——用户离开电脑后此值持续增长。
+pub fn get_system_idle_secs() -> f64 {
+    unsafe {
+        // kCGEventSourceStateHIDSystemState = 1
+        // kCGAnyInputEventType = 0xFFFFFFFF
+        CGEventSourceSecondsSinceLastEventType(1, 0xFFFFFFFF)
+    }
 }
 
 /// 读取当前活跃应用信息 + 窗口标题
