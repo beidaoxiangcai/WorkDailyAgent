@@ -12,6 +12,18 @@ use rusqlite::{params, Connection};
 
 use crate::merger::MergedEvent;
 
+/// 查询返回的事件（供前端展示）
+#[derive(Debug, serde::Serialize)]
+pub struct EventRow {
+    pub id: i64,
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub app: String,
+    pub bundle_id: String,
+    pub window_title: Option<String>,
+    pub duration_ms: i64,
+}
+
 pub struct Storage {
     conn: Mutex<Connection>,
 }
@@ -90,6 +102,30 @@ impl Storage {
     pub fn journal_mode(&self) -> rusqlite::Result<String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+    }
+
+    /// 查询某天 [start, end) 时间范围内的事件，按开始时间倒序返回。
+    /// `start_ts` / `end_ts` 为 Unix 秒（本地 0 点 ~ 次日 0 点）。
+    pub fn query_events(&self, start_ts: i64, end_ts: i64) -> rusqlite::Result<Vec<EventRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, start_ts, end_ts, app, bundle_id, window_title, duration_ms
+             FROM events
+             WHERE start_ts >= ?1 AND start_ts < ?2
+             ORDER BY start_ts DESC",
+        )?;
+        let rows = stmt.query_map(params![start_ts, end_ts], |row| {
+            Ok(EventRow {
+                id: row.get(0)?,
+                start_ts: row.get(1)?,
+                end_ts: row.get(2)?,
+                app: row.get(3)?,
+                bundle_id: row.get(4)?,
+                window_title: row.get(5)?,
+                duration_ms: row.get(6)?,
+            })
+        })?;
+        rows.collect()
     }
 }
 

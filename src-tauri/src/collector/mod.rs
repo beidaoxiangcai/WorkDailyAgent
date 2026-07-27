@@ -1,9 +1,12 @@
 //! 采集模块：3 秒轮询当前活跃应用 + 窗口标题，经合并引擎去抖动/空闲检测后批量写入 SQLite。
 //!
 //! 数据流：Collector 轮询 → RawEvent → Merger（去抖动+空闲检测）→ MergedEvent → Storage（批量写入）
+//! 暂停状态通过共享 Arc<AtomicBool> 暴露，供 Tauri 命令切换。
 
 pub mod macos;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
@@ -18,10 +21,12 @@ pub struct Collector {
     merger: Merger,
     storage: Storage,
     flush_interval_secs: u64,
+    /// 共享暂停标志（true = 暂停）
+    paused: Arc<AtomicBool>,
 }
 
 impl Collector {
-    pub fn new(storage: Storage) -> Self {
+    pub fn new(storage: Storage, paused: Arc<AtomicBool>) -> Self {
         let blacklist = vec![
             "com.agilebits.onepassword-osx".to_string(), // 1Password
             "com.apple.keychainaccess".to_string(),      // 钥匙串访问
@@ -33,6 +38,7 @@ impl Collector {
             merger: Merger::new(),
             storage,
             flush_interval_secs: 10,
+            paused,
         }
     }
 
@@ -61,12 +67,17 @@ impl Collector {
         loop {
             tokio::select! {
                 _ = poll_ticker.tick() => {
+                    if self.paused.load(Ordering::Relaxed) {
+                        // 暂停期间不采集（不更新 merger 状态）
+                        continue;
+                    }
                     if let Some(raw) = self.poll_once() {
                         let idle_secs = macos::get_system_idle_secs();
                         self.merger.on_event(&raw, idle_secs);
                     }
                 }
                 _ = flush_ticker.tick() => {
+                    // 即使暂停也 flush 缓冲中的已闭合事件
                     let events = self.merger.drain_completed();
                     if !events.is_empty() {
                         match self.storage.insert_events(&events) {
