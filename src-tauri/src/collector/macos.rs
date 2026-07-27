@@ -12,15 +12,19 @@ use objc2_app_kit::NSWorkspace;
 // Accessibility API 位于 ApplicationServices 框架（HIServices 子框架）
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef; // 实际为 AXUIElementRef，与 CFTypeRef 兼容
+    fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
     fn AXUIElementCopyAttributeValue(
         element: CFTypeRef,
         attribute: CFStringRef,
         value: *mut CFTypeRef,
     ) -> i32; // AXError：0 = kAXErrorSuccess
     fn AXIsProcessTrusted() -> u8; // macOS Boolean
+}
+
+// CoreFoundation：CFArray 访问（AXWindows 返回 CFArray）
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
     fn CFRelease(cf: CFTypeRef);
-    // CFArray 访问（AXWindows 返回 CFArray）
     fn CFArrayGetCount(array: CFTypeRef) -> isize;
     fn CFArrayGetValueAtIndex(array: CFTypeRef, idx: isize) -> CFTypeRef;
 }
@@ -102,20 +106,21 @@ fn get_window_title(pid: i32) -> Option<String> {
             return None;
         }
 
-        // 第二步：取第一个窗口元素
+        // 第二步：取第一个窗口元素，并在释放数组之前取其 AXTitle
+        // （CFArrayGetValueAtIndex 返回的是未 retain 的引用，数组释放后元素可能被回收）
         let count = CFArrayGetCount(windows_value);
         if count == 0 {
             CFRelease(windows_value);
             return None;
         }
         let window_element = CFArrayGetValueAtIndex(windows_value, 0);
-        CFRelease(windows_value);
 
         if window_element.is_null() {
+            CFRelease(windows_value);
             return None;
         }
 
-        // 第三步：取窗口的 AXTitle 属性
+        // 第三步：取窗口的 AXTitle（在数组释放前完成）
         let title_attr = CFString::new("AXTitle");
         let mut title_value: CFTypeRef = std::ptr::null();
         let err = AXUIElementCopyAttributeValue(
@@ -123,6 +128,9 @@ fn get_window_title(pid: i32) -> Option<String> {
             title_attr.as_concrete_TypeRef(),
             &mut title_value,
         );
+
+        // 现在可以安全释放数组了
+        CFRelease(windows_value);
 
         if err != 0 || title_value.is_null() {
             return None;
