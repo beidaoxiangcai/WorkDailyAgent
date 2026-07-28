@@ -140,11 +140,11 @@ function App() {
     }
   }
 
-  const generateReport = async () => {
+  const generateReport = async (date?: string) => {
     setGenerating(true)
     setError(null)
     try {
-      await invoke<string>('generate_daily_report')
+      await invoke<string>('generate_daily_report', { date: date ?? null })
       setReportTrigger((t) => t + 1)
       setPage('reports')
     } catch (e) {
@@ -162,7 +162,7 @@ function App() {
           <span className={`status-dot ${paused ? 'paused' : ''}`} />
           <button
             className="generate-btn"
-            onClick={generateReport}
+            onClick={() => generateReport()}
             disabled={generating}
           >
             {generating ? '生成中…' : '生成今日日报'}
@@ -196,6 +196,8 @@ function App() {
             activeApp={activeApp}
             selectedDate={timelineDate}
             onDateChange={setTimelineDate}
+            onGenerateReport={() => generateReport(timelineDate)}
+            generating={generating}
           />
         )}
         {page === 'reports' && <ReportsPage refreshTrigger={reportTrigger} />}
@@ -205,7 +207,7 @@ function App() {
   )
 }
 
-// ── 今日时间轴页 ──
+// ── 时间轴页 ──
 function TimelinePage({
   events,
   loading,
@@ -215,6 +217,8 @@ function TimelinePage({
   activeApp,
   selectedDate,
   onDateChange,
+  onGenerateReport,
+  generating,
 }: {
   events: EventRow[]
   loading: boolean
@@ -224,6 +228,8 @@ function TimelinePage({
   activeApp: ActiveAppInfo | null
   selectedDate: string
   onDateChange: (date: string) => void
+  onGenerateReport: () => void
+  generating: boolean
 }) {
   return (
     <>
@@ -250,9 +256,18 @@ function TimelinePage({
             onChange={(e) => onDateChange(e.target.value)}
           />
         </div>
-        <button className="refresh-btn" onClick={onRefresh} disabled={loading}>
-          {loading ? '刷新中…' : '刷新'}
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            className="generate-btn-sm"
+            onClick={onGenerateReport}
+            disabled={generating || events.length === 0}
+          >
+            {generating ? '生成中…' : '生成日报'}
+          </button>
+          <button className="refresh-btn" onClick={onRefresh} disabled={loading}>
+            {loading ? '刷新中…' : '刷新'}
+          </button>
+        </div>
       </div>
       {error && <div className="error-msg">加载失败: {error}</div>}
       {!error && events.length === 0 && (
@@ -287,6 +302,7 @@ function ReportsPage({ refreshTrigger }: { refreshTrigger: number }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copiedId, setCopiedId] = useState<number | null>(null)
+  const [selectedDate, setSelectedDate] = useState<string>('')
 
   const loadReports = useCallback(async () => {
     setLoading(true)
@@ -294,6 +310,7 @@ function ReportsPage({ refreshTrigger }: { refreshTrigger: number }) {
     try {
       const rows = await invoke<ReportRow[]>('get_reports', {
         reportType: tab,
+        date: selectedDate || null,
       })
       setReports(rows)
     } catch (e) {
@@ -301,7 +318,7 @@ function ReportsPage({ refreshTrigger }: { refreshTrigger: number }) {
     } finally {
       setLoading(false)
     }
-  }, [tab])
+  }, [tab, selectedDate])
 
   useEffect(() => {
     loadReports()
@@ -319,19 +336,36 @@ function ReportsPage({ refreshTrigger }: { refreshTrigger: number }) {
 
   return (
     <>
-      <div className="reports-tabs">
-        <button
-          className={`tab-btn ${tab === 'daily' ? 'active' : ''}`}
-          onClick={() => setTab('daily')}
-        >
-          日报
-        </button>
+      <div className="reports-toolbar">
+        <div className="reports-tabs">
+          <button
+            className={`tab-btn ${tab === 'daily' ? 'active' : ''}`}
+            onClick={() => setTab('daily')}
+          >
+            日报
+          </button>
         <button
           className={`tab-btn ${tab === 'weekly' ? 'active' : ''}`}
           onClick={() => setTab('weekly')}
         >
           周报
         </button>
+        </div>
+        <input
+          type="date"
+          className="date-picker"
+          value={selectedDate}
+          max={todayStr()}
+          onChange={(e) => setSelectedDate(e.target.value)}
+        />
+        {selectedDate && (
+          <button
+            className="refresh-btn"
+            onClick={() => setSelectedDate('')}
+          >
+            全部
+          </button>
+        )}
       </div>
 
       {error && <div className="error-msg">加载失败: {error}</div>}

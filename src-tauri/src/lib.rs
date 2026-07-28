@@ -18,12 +18,13 @@ fn query_events(date: String, state: tauri::State<'_, AppState>) -> Result<Vec<s
     state.storage.query_events(start_ts, end_ts).map_err(|e| e.to_string())
 }
 
-/// 生成今日日报：查当日事件 → 组装 Prompt → 调 LLM（失败降级模板）→ 存 reports 表 → 返回内容
+/// 生成日报：查指定日期事件 → 组装 Prompt → 调 LLM（失败降级模板）→ 存 reports 表 → 返回内容
+/// date 参数为 "YYYY-MM-DD"，不传则用今天
 #[tauri::command]
-async fn generate_daily_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let today = today_str();
-    let (start_ts, end_ts) = parse_day_range(&today)
-        .ok_or_else(|| format!("无效日期: {}", today))?;
+async fn generate_daily_report(date: Option<String>, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let target_date = date.unwrap_or_else(today_str);
+    let (start_ts, end_ts) = parse_day_range(&target_date)
+        .ok_or_else(|| format!("无效日期: {}", target_date))?;
 
     // 查当日事件
     let events = state
@@ -32,7 +33,7 @@ async fn generate_daily_report(state: tauri::State<'_, AppState>) -> Result<Stri
         .map_err(|e| e.to_string())?;
 
     if events.is_empty() {
-        return Err("今日无采集事件，请先使用一段时间后再生成日报".to_string());
+        return Err(format!("{} 无采集事件，请先使用一段时间后再生成日报", target_date));
     }
 
     // 生成日报内容
@@ -46,10 +47,10 @@ async fn generate_daily_report(state: tauri::State<'_, AppState>) -> Result<Stri
 
     state
         .storage
-        .save_report("daily", &today, &report.content, &event_ids, report.llm_model.as_deref())
+        .save_report("daily", &target_date, &report.content, &event_ids, report.llm_model.as_deref())
         .map_err(|e| e.to_string())?;
 
-    log::info!("[generator] 日报已保存，日期={}", today);
+    log::info!("[generator] 日报已保存，日期={}", target_date);
     Ok(report.content)
 }
 
@@ -177,7 +178,7 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y as i32 + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
-/// 把 "YYYY-MM-DD"（本地时间）转为当天的 Unix 秒区间 [start, end)
+/// 把 "YYYY-MM-DD"（本地时间 UTC+8）转为当天的 Unix 秒区间 [start, end)
 fn parse_day_range(date: &str) -> Option<(i64, i64)> {
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() != 3 {
@@ -186,8 +187,9 @@ fn parse_day_range(date: &str) -> Option<(i64, i64)> {
     let y: i32 = parts[0].parse().ok()?;
     let m: u32 = parts[1].parse().ok()?;
     let d: u32 = parts[2].parse().ok()?;
-    let start = days_from_civil(y, m, d) * 86400;
-    Some((start, start + 86400))
+    let utc_start = days_from_civil(y, m, d) * 86400;
+    let tz_offset = 8 * 3600; // UTC+8
+    Some((utc_start - tz_offset, utc_start - tz_offset + 86400))
 }
 
 /// Howard Hinnant days_from_civil：公历日期 → Unix 天数（1970-01-01 起）
