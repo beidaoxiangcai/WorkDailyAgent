@@ -82,15 +82,32 @@
   padding: 24px;
 }
 
-/* ── 今日时间轴 ── */
+/* ── 时间轴 ── */
 .timeline-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 16px;
 }
+.timeline-title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
 .timeline-header h2 {
   font-size: 18px;
+}
+.date-picker {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text-h);
+}
+.date-picker:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 .refresh-btn {
   padding: 6px 12px;
@@ -233,6 +250,24 @@
   color: var(--text-h);
   white-space: pre-wrap;
   word-break: break-word;
+}
+.report-content.collapsed {
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.expand-btn {
+  margin-top: 8px;
+  padding: 2px 8px;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+}
+.expand-btn:hover {
+  text-decoration: underline;
 }
 
 /* ── 正在记录提示 ── */

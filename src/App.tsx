@@ -37,7 +37,7 @@ interface ActiveAppInfo {
 // ── 导航项 ──
 type Page = 'timeline' | 'reports' | 'settings'
 const NAV_ITEMS: { key: Page; label: string }[] = [
-  { key: 'timeline', label: '今日时间轴' },
+  { key: 'timeline', label: '时间轴' },
   { key: 'reports', label: '日报/周报' },
   { key: 'settings', label: '设置' },
 ]
@@ -85,19 +85,21 @@ function App() {
   const [paused, setPaused] = useState(false)
   const [generating, setGenerating] = useState(false)
   const [activeApp, setActiveApp] = useState<ActiveAppInfo | null>(null)
+  const [timelineDate, setTimelineDate] = useState(todayStr())
+  const [reportTrigger, setReportTrigger] = useState(0)
 
   const loadEvents = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const rows = await invoke<EventRow[]>('query_events', { date: todayStr() })
+      const rows = await invoke<EventRow[]>('query_events', { date: timelineDate })
       setEvents(rows)
     } catch (e) {
       setError(String(e))
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [timelineDate])
 
   const loadPaused = useCallback(async () => {
     try {
@@ -143,6 +145,7 @@ function App() {
     setError(null)
     try {
       await invoke<string>('generate_daily_report')
+      setReportTrigger((t) => t + 1)
       setPage('reports')
     } catch (e) {
       setError(String(e))
@@ -191,9 +194,11 @@ function App() {
             onRefresh={loadEvents}
             paused={paused}
             activeApp={activeApp}
+            selectedDate={timelineDate}
+            onDateChange={setTimelineDate}
           />
         )}
-        {page === 'reports' && <ReportsPage />}
+        {page === 'reports' && <ReportsPage refreshTrigger={reportTrigger} />}
         {page === 'settings' && <SettingsPage />}
       </main>
     </div>
@@ -208,6 +213,8 @@ function TimelinePage({
   onRefresh,
   paused,
   activeApp,
+  selectedDate,
+  onDateChange,
 }: {
   events: EventRow[]
   loading: boolean
@@ -215,6 +222,8 @@ function TimelinePage({
   onRefresh: () => void
   paused: boolean
   activeApp: ActiveAppInfo | null
+  selectedDate: string
+  onDateChange: (date: string) => void
 }) {
   return (
     <>
@@ -231,7 +240,16 @@ function TimelinePage({
       )}
 
       <div className="timeline-header">
-        <h2>今日时间轴</h2>
+        <div className="timeline-title-row">
+          <h2>时间轴</h2>
+          <input
+            type="date"
+            className="date-picker"
+            value={selectedDate}
+            max={todayStr()}
+            onChange={(e) => onDateChange(e.target.value)}
+          />
+        </div>
         <button className="refresh-btn" onClick={onRefresh} disabled={loading}>
           {loading ? '刷新中…' : '刷新'}
         </button>
@@ -263,7 +281,7 @@ function TimelinePage({
 }
 
 // ── 日报/周报页 ──
-function ReportsPage() {
+function ReportsPage({ refreshTrigger }: { refreshTrigger: number }) {
   const [tab, setTab] = useState<'daily' | 'weekly'>('daily')
   const [reports, setReports] = useState<ReportRow[]>([])
   const [loading, setLoading] = useState(false)
@@ -287,7 +305,7 @@ function ReportsPage() {
 
   useEffect(() => {
     loadReports()
-  }, [loadReports])
+  }, [loadReports, refreshTrigger])
 
   const handleCopy = async (report: ReportRow) => {
     try {
@@ -325,29 +343,59 @@ function ReportsPage() {
       {!error && reports.length > 0 && (
         <div className="report-list">
           {reports.map((r) => (
-            <div className="report-card" key={r.id}>
-              <div className="report-card-header">
-                <span className="report-meta">
-                  {r.period_date} · {formatDateTime(r.generated_at)}
-                </span>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                  {r.llm_model && (
-                    <span className="report-model">{r.llm_model}</span>
-                  )}
-                  <button
-                    className={`copy-btn ${copiedId === r.id ? 'copied' : ''}`}
-                    onClick={() => handleCopy(r)}
-                  >
-                    {copiedId === r.id ? '已复制' : '复制'}
-                  </button>
-                </div>
-              </div>
-              <div className="report-content">{r.content}</div>
-            </div>
+            <ReportCard
+              key={r.id}
+              report={r}
+              copied={copiedId === r.id}
+              onCopy={() => handleCopy(r)}
+            />
           ))}
         </div>
       )}
     </>
+  )
+}
+
+// ── 日报卡片（超过5行折叠） ──
+function ReportCard({
+  report,
+  copied,
+  onCopy,
+}: {
+  report: ReportRow
+  copied: boolean
+  onCopy: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <div className="report-card">
+      <div className="report-card-header">
+        <span className="report-meta">
+          {report.period_date} · {formatDateTime(report.generated_at)}
+        </span>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {report.llm_model && (
+            <span className="report-model">{report.llm_model}</span>
+          )}
+          <button
+            className={`copy-btn ${copied ? 'copied' : ''}`}
+            onClick={onCopy}
+          >
+            {copied ? '已复制' : '复制'}
+          </button>
+        </div>
+      </div>
+      <div className={`report-content ${expanded ? '' : 'collapsed'}`}>
+        {report.content}
+      </div>
+      <button
+        className="expand-btn"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        {expanded ? '收起' : '展开全部'}
+      </button>
+    </div>
   )
 }
 
