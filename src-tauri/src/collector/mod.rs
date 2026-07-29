@@ -85,7 +85,8 @@ impl Collector {
                     }
                     if let Some(raw) = self.poll_once() {
                         let idle_secs = macos::get_system_idle_secs();
-                        self.merger.on_event(&raw, idle_secs);
+                        let display_asleep = macos::is_display_asleep();
+                        self.merger.on_event(&raw, idle_secs, display_asleep);
                     }
                 }
                 _ = flush_ticker.tick() => {

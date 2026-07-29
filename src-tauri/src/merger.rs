@@ -4,7 +4,7 @@
 //! - **累加**：app + title 相同 → 更新 end_ts，不产生新事件
 //! - **闭合**：app / title 变化 → 闭合上一条，开启新事件
 //! - **去抖动**：A→B→A 在 3 秒内 → 合并为一条 A（忽略 B 抖动）
-//! - **空闲检测**：系统空闲超过 5 分钟 → 闭合当前事件，标记离开
+//! - **空闲检测**：显示器休眠 → 闭合当前事件，标记离开；恢复时生成"(空闲)"事件
 //!
 //! 输出：MergedEvent（闭合事件），由 storage 批量写入 SQLite。
 
@@ -61,10 +61,10 @@ pub struct Merger {
     completed: Vec<MergedEvent>,
     /// 是否处于空闲状态
     is_idle: bool,
+    /// 空闲开始时间戳（最后一次实际活动时间）
+    idle_start_ts: Option<i64>,
     /// 去抖动阈值（秒）：A→B→A 间隔 ≤ 此值则合并
     debounce_secs: i64,
-    /// 空闲阈值（秒）：系统空闲超过此值则判定离开
-    idle_threshold_secs: i64,
 }
 
 impl Merger {
@@ -74,26 +74,47 @@ impl Merger {
             prev: None,
             completed: Vec::new(),
             is_idle: false,
+            idle_start_ts: None,
             debounce_secs: 3,
-            idle_threshold_secs: 300, // 5 分钟
         }
     }
 
     /// 处理一条 RawEvent。
-    /// `idle_secs` 为系统空闲时间（秒），由调用方通过 macOS API 获取。
-    pub fn on_event(&mut self, raw: &RawEvent, idle_secs: f64) {
-        // ── 空闲检测 ──
-        if idle_secs > self.idle_threshold_secs as f64 {
+    /// `idle_secs` 为系统空闲时间（秒），用于计算最后一次实际活动时间。
+    /// `display_asleep` 为显示器是否休眠（true = 用户离开）。
+    pub fn on_event(&mut self, raw: &RawEvent, idle_secs: f64, display_asleep: bool) {
+        // ── 空闲检测：显示器休眠 = 真正离开（看视频时浏览器阻止休眠，不会误判）──
+        if display_asleep {
             if !self.is_idle {
                 self.enter_idle(raw.ts, idle_secs);
             }
             return;
         }
 
-        // 从空闲恢复
+        // 从空闲恢复：生成"(空闲)"事件，开始新事件
         if self.is_idle {
             self.is_idle = false;
+            let idle_end = raw.ts;
+            if let Some(start) = self.idle_start_ts.take() {
+                if idle_end > start {
+                    let duration_ms = (idle_end - start) * 1000;
+                    info!(
+                        "[merger] 空闲结束: {}s，生成空闲事件",
+                        duration_ms / 1000
+                    );
+                    self.completed.push(MergedEvent {
+                        app: "(空闲)".to_string(),
+                        bundle_id: String::new(),
+                        window_title: Some("系统空闲".to_string()),
+                        start_ts: start,
+                        end_ts: idle_end,
+                        duration_ms,
+                    });
+                }
+            }
             info!("[merger] 用户恢复活动，开始新事件");
+            self.start_new(raw);
+            return;
         }
 
         // ── 同一应用+标题：累加时长 ──
@@ -199,15 +220,18 @@ impl Merger {
 
     fn enter_idle(&mut self, now: i64, idle_secs: f64) {
         self.is_idle = true;
+        // 最后一次实际活动时间 = 当前时间 - 空闲时长
+        let last_activity = (now - idle_secs as i64).max(0);
+        self.idle_start_ts = Some(last_activity);
+
         // 闭合当前事件，end_ts 修正为最后一次实际活动时间
         if let Some(cur) = self.current.take() {
-            let end_ts = (now - idle_secs as i64).max(cur.start_ts);
+            let end_ts = last_activity.max(cur.start_ts);
             let mut event = cur.close();
             event.end_ts = end_ts;
             event.duration_ms = (end_ts - event.start_ts) * 1000;
             info!(
-                "[merger] 空闲检测: 系统空闲 {:.0}s，闭合事件 app={} | duration={}s",
-                idle_secs,
+                "[merger] 空闲检测: 显示器休眠，闭合事件 app={} | duration={}s",
                 event.app,
                 event.duration_ms / 1000
             );

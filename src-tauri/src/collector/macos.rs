@@ -33,6 +33,8 @@ extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGEventSourceSecondsSinceLastEventType(stateID: u32, eventType: u32) -> f64;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsAsleep(display_id: u32) -> u8;
 }
 
 pub struct ActiveApp {
@@ -48,12 +50,20 @@ pub fn check_accessibility_trusted() -> bool {
 }
 
 /// 获取系统空闲时间（秒）：自上次键盘/鼠标输入以来经过的时间。
-/// 用于空闲检测——用户离开电脑后此值持续增长。
+/// 用于计算最后一次实际活动时间（配合显示器休眠检测使用）。
 pub fn get_system_idle_secs() -> f64 {
     unsafe {
         // kCGEventSourceStateHIDSystemState = 1
         // kCGAnyInputEventType = 0xFFFFFFFF
         CGEventSourceSecondsSinceLastEventType(1, 0xFFFFFFFF)
+    }
+}
+
+/// 检测显示器是否休眠。显示器休眠 = 用户真正离开（看视频时浏览器会阻止休眠）。
+pub fn is_display_asleep() -> bool {
+    unsafe {
+        let display_id = CGMainDisplayID();
+        CGDisplayIsAsleep(display_id) != 0
     }
 }
 
