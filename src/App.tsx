@@ -11,6 +11,7 @@ interface EventRow {
   bundle_id: string
   window_title: string | null
   duration_ms: number
+  ongoing: boolean
 }
 
 interface ReportRow {

@@ -21,6 +21,7 @@ pub struct RawEvent {
 }
 
 /// 合并后事件（闭合，含时长）
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergedEvent {
     pub app: String,
     pub bundle_id: String,
@@ -28,6 +29,13 @@ pub struct MergedEvent {
     pub start_ts: i64,
     pub end_ts: i64,
     pub duration_ms: i64,
+}
+
+/// 供查询层读取的未落库事件。
+#[derive(Clone, Debug)]
+pub struct RuntimeEvent {
+    pub event: MergedEvent,
+    pub ongoing: bool,
 }
 
 /// 正在跟踪的活跃事件
@@ -41,13 +49,18 @@ struct ActiveEvent {
 
 impl ActiveEvent {
     fn close(&self) -> MergedEvent {
+        self.close_at(self.last_ts)
+    }
+
+    fn close_at(&self, end_ts: i64) -> MergedEvent {
+        let end_ts = end_ts.max(self.start_ts);
         MergedEvent {
             app: self.app.clone(),
             bundle_id: self.bundle_id.clone(),
             window_title: self.title.clone(),
             start_ts: self.start_ts,
-            end_ts: self.last_ts,
-            duration_ms: (self.last_ts - self.start_ts) * 1000,
+            end_ts,
+            duration_ms: (end_ts - self.start_ts) * 1000,
         }
     }
 }
@@ -98,18 +111,8 @@ impl Merger {
             if let Some(start) = self.idle_start_ts.take() {
                 if idle_end > start {
                     let duration_ms = (idle_end - start) * 1000;
-                    info!(
-                        "[merger] 空闲结束: {}s，生成空闲事件",
-                        duration_ms / 1000
-                    );
-                    self.completed.push(MergedEvent {
-                        app: "(空闲)".to_string(),
-                        bundle_id: String::new(),
-                        window_title: Some("系统空闲".to_string()),
-                        start_ts: start,
-                        end_ts: idle_end,
-                        duration_ms,
-                    });
+                    info!("[merger] 空闲结束: {}s，生成空闲事件", duration_ms / 1000);
+                    self.completed.push(idle_event(start, idle_end));
                 }
             }
             info!("[merger] 用户恢复活动，开始新事件");
@@ -182,15 +185,77 @@ impl Merger {
         std::mem::take(&mut self.completed)
     }
 
-    /// 闭合所有未完成事件（用于退出时 flush）
-    #[allow(dead_code)]
-    pub fn flush_remaining(&mut self) {
+    /// 写入失败时将事件放回缓冲区，等待下次 flush。
+    pub fn restore_completed(&mut self, mut events: Vec<MergedEvent>) {
+        events.append(&mut self.completed);
+        self.completed = events;
+    }
+
+    /// 暂停、进入黑名单或退出时在指定时刻强制闭合运行态。
+    pub fn force_boundary(&mut self, at_ts: i64) {
         if let Some(p) = self.prev.take() {
-            self.completed.push(p.close());
+            let event = p.close();
+            if event.duration_ms > 0 {
+                self.completed.push(event);
+            }
         }
         if let Some(c) = self.current.take() {
-            self.completed.push(c.close());
+            let event = c.close_at(at_ts);
+            if event.duration_ms > 0 {
+                self.completed.push(event);
+            }
         }
+        if self.is_idle {
+            if let Some(start_ts) = self.idle_start_ts.take() {
+                if at_ts > start_ts {
+                    self.completed.push(idle_event(start_ts, at_ts));
+                }
+            }
+            self.is_idle = false;
+        }
+    }
+
+    /// 闭合所有未完成事件（用于退出时 flush）。
+    pub fn flush_remaining(&mut self, at_ts: i64) {
+        self.force_boundary(at_ts);
+    }
+
+    /// 返回已闭合待写、去抖待确认和当前进行事件的快照。
+    pub fn runtime_events(&self, now_ts: i64) -> Vec<RuntimeEvent> {
+        let mut events = self
+            .completed
+            .iter()
+            .cloned()
+            .map(|event| RuntimeEvent {
+                event,
+                ongoing: false,
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(p) = &self.prev {
+            events.push(RuntimeEvent {
+                event: p.close(),
+                ongoing: false,
+            });
+        }
+        if let Some(c) = &self.current {
+            events.push(RuntimeEvent {
+                event: c.close_at(now_ts),
+                ongoing: true,
+            });
+        }
+        if self.is_idle {
+            if let Some(start_ts) = self.idle_start_ts {
+                if now_ts > start_ts {
+                    events.push(RuntimeEvent {
+                        event: idle_event(start_ts, now_ts),
+                        ongoing: true,
+                    });
+                }
+            }
+        }
+
+        events
     }
 
     fn start_new(&mut self, raw: &RawEvent) {
@@ -243,5 +308,94 @@ impl Merger {
         if let Some(p) = self.prev.take() {
             self.completed.push(p.close());
         }
+    }
+}
+
+fn idle_event(start_ts: i64, end_ts: i64) -> MergedEvent {
+    MergedEvent {
+        app: "(空闲)".to_string(),
+        bundle_id: String::new(),
+        window_title: Some("系统空闲".to_string()),
+        start_ts,
+        end_ts,
+        duration_ms: (end_ts - start_ts) * 1000,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(ts: i64, app: &str, title: &str) -> RawEvent {
+        RawEvent {
+            ts,
+            app: app.to_string(),
+            bundle_id: format!("com.test.{}", app.to_lowercase()),
+            pid: 1,
+            window_title: Some(title.to_string()),
+        }
+    }
+
+    #[test]
+    fn force_boundary_closes_current_at_requested_time() {
+        let mut merger = Merger::new();
+        merger.on_event(&raw(100, "Editor", "file"), 0.0, false);
+        merger.on_event(&raw(103, "Editor", "file"), 0.0, false);
+
+        merger.force_boundary(110);
+
+        let completed = merger.drain_completed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].start_ts, 100);
+        assert_eq!(completed[0].end_ts, 110);
+        assert_eq!(completed[0].duration_ms, 10_000);
+        assert!(merger.runtime_events(120).is_empty());
+    }
+
+    #[test]
+    fn force_boundary_prevents_debounce_across_gap() {
+        let mut merger = Merger::new();
+        merger.on_event(&raw(100, "Editor", "file"), 0.0, false);
+        merger.force_boundary(105);
+        merger.on_event(&raw(108, "Editor", "file"), 0.0, false);
+        merger.flush_remaining(112);
+
+        let completed = merger.drain_completed();
+        assert_eq!(completed.len(), 2);
+        assert_eq!((completed[0].start_ts, completed[0].end_ts), (100, 105));
+        assert_eq!((completed[1].start_ts, completed[1].end_ts), (108, 112));
+    }
+
+    #[test]
+    fn runtime_snapshot_contains_pending_and_ongoing_events() {
+        let mut merger = Merger::new();
+        merger.on_event(&raw(100, "Editor", "file"), 0.0, false);
+        merger.on_event(&raw(110, "Browser", "page"), 0.0, false);
+
+        let snapshot = merger.runtime_events(115);
+        assert_eq!(snapshot.len(), 2);
+        assert!(!snapshot[0].ongoing);
+        assert_eq!(
+            (snapshot[0].event.start_ts, snapshot[0].event.end_ts),
+            (100, 110)
+        );
+        assert!(snapshot[1].ongoing);
+        assert_eq!(
+            (snapshot[1].event.start_ts, snapshot[1].event.end_ts),
+            (110, 115)
+        );
+    }
+
+    #[test]
+    fn flush_remaining_closes_current_at_exit_time() {
+        let mut merger = Merger::new();
+        merger.on_event(&raw(100, "Editor", "file"), 0.0, false);
+
+        merger.flush_remaining(109);
+
+        let completed = merger.drain_completed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].end_ts, 109);
+        assert_eq!(completed[0].duration_ms, 9_000);
     }
 }

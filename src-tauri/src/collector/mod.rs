@@ -5,14 +5,22 @@
 
 pub mod macos;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
+use tokio::sync::watch;
 
-use crate::merger::{Merger, RawEvent};
+use crate::merger::{Merger, RawEvent, RuntimeEvent};
 use crate::storage::Storage;
+
+pub type SharedRuntimeEvents = Arc<Mutex<Vec<RuntimeEvent>>>;
+
+enum PollResult {
+    Tracked(RawEvent),
+    Excluded(i64),
+    Unavailable,
+}
 
 pub struct Collector {
     interval_secs: u64,
@@ -23,12 +31,20 @@ pub struct Collector {
     flush_interval_secs: u64,
     /// 黑名单刷新间隔（秒）
     blacklist_refresh_secs: u64,
-    /// 共享暂停标志（true = 暂停）
-    paused: Arc<AtomicBool>,
+    pause_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+    shutdown_done: mpsc::SyncSender<()>,
+    runtime_events: SharedRuntimeEvents,
 }
 
 impl Collector {
-    pub fn new(storage: Storage, paused: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        storage: Storage,
+        pause_rx: watch::Receiver<bool>,
+        shutdown_rx: watch::Receiver<bool>,
+        shutdown_done: mpsc::SyncSender<()>,
+        runtime_events: SharedRuntimeEvents,
+    ) -> Self {
         Self {
             interval_secs: 3,
             blacklist: Vec::new(),
@@ -36,7 +52,10 @@ impl Collector {
             storage,
             flush_interval_secs: 10,
             blacklist_refresh_secs: 30,
-            paused,
+            pause_rx,
+            shutdown_rx,
+            shutdown_done,
+            runtime_events,
         }
     }
 
@@ -75,27 +94,46 @@ impl Collector {
 
         let mut poll_ticker = tokio::time::interval(Duration::from_secs(self.interval_secs));
         let mut flush_ticker = tokio::time::interval(Duration::from_secs(self.flush_interval_secs));
-        let mut blacklist_ticker = tokio::time::interval(Duration::from_secs(self.blacklist_refresh_secs));
+        let mut blacklist_ticker =
+            tokio::time::interval(Duration::from_secs(self.blacklist_refresh_secs));
 
         loop {
             tokio::select! {
                 _ = poll_ticker.tick() => {
-                    if self.paused.load(Ordering::Relaxed) {
+                    if *self.pause_rx.borrow() {
                         continue;
                     }
-                    if let Some(raw) = self.poll_once() {
-                        let idle_secs = macos::get_system_idle_secs();
-                        let display_asleep = macos::is_display_asleep();
-                        self.merger.on_event(&raw, idle_secs, display_asleep);
+                    match self.poll_once() {
+                        PollResult::Tracked(raw) => {
+                            let idle_secs = macos::get_system_idle_secs();
+                            let display_asleep = macos::is_display_asleep();
+                            self.merger.on_event(&raw, idle_secs, display_asleep);
+                        }
+                        PollResult::Excluded(ts) => {
+                            self.merger.force_boundary(ts);
+                        }
+                        PollResult::Unavailable => {}
                     }
+                    self.publish_runtime(now_secs());
                 }
                 _ = flush_ticker.tick() => {
-                    let events = self.merger.drain_completed();
-                    if !events.is_empty() {
-                        match self.storage.insert_events(&events) {
-                            Ok(n) => info!("[storage] 批量写入 {} 条事件", n),
-                            Err(e) => warn!("[storage] 写入失败: {}", e),
-                        }
+                    self.flush_completed();
+                }
+                changed = self.pause_rx.changed() => {
+                    if changed.is_ok() && *self.pause_rx.borrow() {
+                        self.merger.force_boundary(now_secs());
+                        self.publish_runtime(now_secs());
+                        self.flush_completed();
+                    }
+                }
+                changed = self.shutdown_rx.changed() => {
+                    if changed.is_err() || *self.shutdown_rx.borrow() {
+                        self.merger.flush_remaining(now_secs());
+                        self.publish_runtime(now_secs());
+                        self.flush_completed();
+                        let _ = self.shutdown_done.send(());
+                        info!("[collector] 采集模块已停止，剩余事件已 flush");
+                        break;
                     }
                 }
                 _ = blacklist_ticker.tick() => {
@@ -106,8 +144,33 @@ impl Collector {
         }
     }
 
-    /// 轮询一次：读取活跃应用，黑名单过滤，返回 RawEvent
-    fn poll_once(&self) -> Option<RawEvent> {
+    fn publish_runtime(&self, now_ts: i64) {
+        let snapshot = self.merger.runtime_events(now_ts);
+        match self.runtime_events.lock() {
+            Ok(mut shared) => *shared = snapshot,
+            Err(e) => warn!("[collector] 更新运行态快照失败: {}", e),
+        }
+    }
+
+    fn flush_completed(&mut self) {
+        let events = self.merger.drain_completed();
+        if events.is_empty() {
+            self.publish_runtime(now_secs());
+            return;
+        }
+
+        match self.storage.insert_events(&events) {
+            Ok(n) => info!("[storage] 批量写入 {} 条事件", n),
+            Err(e) => {
+                warn!("[storage] 写入失败: {}", e);
+                self.merger.restore_completed(events);
+            }
+        }
+        self.publish_runtime(now_secs());
+    }
+
+    /// 轮询一次：返回可记录事件、黑名单边界或读取失败。
+    fn poll_once(&self) -> PollResult {
         match macos::get_active_app() {
             Some(app) => {
                 if self.blacklist.iter().any(|b| b == &app.bundle_id) {
@@ -115,10 +178,10 @@ impl Collector {
                         "[collector] (黑名单过滤) app={} bundle={}",
                         app.app_name, app.bundle_id
                     );
-                    return None;
+                    return PollResult::Excluded(now_secs());
                 }
                 let ts = now_secs();
-                Some(RawEvent {
+                PollResult::Tracked(RawEvent {
                     ts,
                     app: app.app_name,
                     bundle_id: app.bundle_id,
@@ -128,7 +191,7 @@ impl Collector {
             }
             None => {
                 warn!("[collector] 读取活跃应用失败");
-                None
+                PollResult::Unavailable
             }
         }
     }

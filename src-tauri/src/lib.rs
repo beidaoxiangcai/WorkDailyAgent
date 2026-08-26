@@ -3,37 +3,49 @@ mod generator;
 mod merger;
 mod storage;
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use tauri::Manager;
+use tokio::sync::watch;
 
 /// 共享暂停状态（前端通过命令切换）
-struct PausedState(Arc<AtomicBool>);
+struct PausedState {
+    current: Arc<AtomicBool>,
+    changes: watch::Sender<bool>,
+}
 
 /// 查询某天的事件。date 格式 "YYYY-MM-DD"（本地时间），返回该日 0 点 ~ 次日 0 点的事件。
 #[tauri::command]
-fn query_events(date: String, state: tauri::State<'_, AppState>) -> Result<Vec<storage::EventRow>, String> {
+fn query_events(
+    date: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<storage::EventRow>, String> {
     let (start_ts, end_ts) = parse_day_range(&date).ok_or_else(|| format!("无效日期: {}", date))?;
-    state.storage.query_events(start_ts, end_ts).map_err(|e| e.to_string())
+    query_day_events(&state, start_ts, end_ts)
 }
 
 /// 生成日报：查指定日期事件 → 组装 Prompt → 调 LLM（失败降级模板）→ 存 reports 表 → 返回内容
 /// date 参数为 "YYYY-MM-DD"，不传则用今天
 #[tauri::command]
-async fn generate_daily_report(date: Option<String>, state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn generate_daily_report(
+    date: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
     let target_date = date.unwrap_or_else(today_str);
-    let (start_ts, end_ts) = parse_day_range(&target_date)
-        .ok_or_else(|| format!("无效日期: {}", target_date))?;
+    let (start_ts, end_ts) =
+        parse_day_range(&target_date).ok_or_else(|| format!("无效日期: {}", target_date))?;
 
     // 查当日事件
-    let events = state
-        .storage
-        .query_events(start_ts, end_ts)
-        .map_err(|e| e.to_string())?;
+    let events = query_day_events(&state, start_ts, end_ts)?;
 
     if events.is_empty() {
-        return Err(format!("{} 无采集事件，请先使用一段时间后再生成日报", target_date));
+        return Err(format!(
+            "{} 无采集事件，请先使用一段时间后再生成日报",
+            target_date
+        ));
     }
 
     // 生成日报内容
@@ -41,13 +53,23 @@ async fn generate_daily_report(date: Option<String>, state: tauri::State<'_, App
 
     // 存入 reports 表
     let event_ids = serde_json::to_string(
-        &events.iter().map(|e| e.id).collect::<Vec<_>>(),
+        &events
+            .iter()
+            .filter(|e| e.id > 0)
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
     )
     .unwrap_or_else(|_| "[]".to_string());
 
     state
         .storage
-        .save_report("daily", &target_date, &report.content, &event_ids, report.llm_model.as_deref())
+        .save_report(
+            "daily",
+            &target_date,
+            &report.content,
+            &event_ids,
+            report.llm_model.as_deref(),
+        )
         .map_err(|e| e.to_string())?;
 
     log::info!("[generator] 日报已保存，日期={}", target_date);
@@ -70,14 +92,18 @@ fn get_reports(
 /// 设置采集暂停状态。paused=true 暂停，false 恢复。
 #[tauri::command]
 fn set_paused(paused: bool, paused_state: tauri::State<'_, PausedState>) {
-    paused_state.0.store(paused, Ordering::Relaxed);
-    log::info!("[collector] 采集状态: {}", if paused { "已暂停" } else { "采集中" });
+    paused_state.current.store(paused, Ordering::Relaxed);
+    paused_state.changes.send_replace(paused);
+    log::info!(
+        "[collector] 采集状态: {}",
+        if paused { "已暂停" } else { "采集中" }
+    );
 }
 
 /// 读取当前采集是否暂停
 #[tauri::command]
 fn is_paused(paused_state: tauri::State<'_, PausedState>) -> bool {
-    paused_state.0.load(Ordering::Relaxed)
+    paused_state.current.load(Ordering::Relaxed)
 }
 
 // ── 黑名单管理 ──
@@ -90,14 +116,24 @@ fn get_blacklist(state: tauri::State<'_, AppState>) -> Result<Vec<storage::Black
 
 /// 添加黑名单项
 #[tauri::command]
-fn add_blacklist(bundle_id: String, app_name: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.storage.add_blacklist(&bundle_id, &app_name).map_err(|e| e.to_string())
+fn add_blacklist(
+    bundle_id: String,
+    app_name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .storage
+        .add_blacklist(&bundle_id, &app_name)
+        .map_err(|e| e.to_string())
 }
 
 /// 删除黑名单项
 #[tauri::command]
 fn remove_blacklist(bundle_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.storage.remove_blacklist(&bundle_id).map_err(|e| e.to_string())
+    state
+        .storage
+        .remove_blacklist(&bundle_id)
+        .map_err(|e| e.to_string())
 }
 
 // ── 数据清空 ──
@@ -146,14 +182,94 @@ struct ActiveAppInfo {
 /// 持有 Storage 供命令使用
 struct AppState {
     storage: storage::Storage,
+    runtime_events: collector::SharedRuntimeEvents,
+}
+
+fn query_day_events(
+    state: &AppState,
+    start_ts: i64,
+    end_ts: i64,
+) -> Result<Vec<storage::EventRow>, String> {
+    let mut rows = state
+        .storage
+        .query_events(start_ts, end_ts)
+        .map_err(|e| e.to_string())?;
+    let now = now_secs();
+    let runtime = state
+        .runtime_events
+        .lock()
+        .map_err(|e| format!("读取运行态失败: {}", e))?
+        .clone();
+    merge_runtime_events(&mut rows, runtime, start_ts, end_ts, now);
+
+    rows.sort_by(|a, b| {
+        b.start_ts
+            .cmp(&a.start_ts)
+            .then_with(|| b.end_ts.cmp(&a.end_ts))
+    });
+    Ok(rows)
+}
+
+fn merge_runtime_events(
+    rows: &mut Vec<storage::EventRow>,
+    runtime: Vec<merger::RuntimeEvent>,
+    start_ts: i64,
+    end_ts: i64,
+    now: i64,
+) {
+    let mut seen = rows.iter().map(event_key).collect::<HashSet<_>>();
+
+    for (index, runtime_event) in runtime.into_iter().enumerate() {
+        let event = runtime_event.event;
+        let event_end = if runtime_event.ongoing {
+            now.max(event.end_ts)
+        } else {
+            event.end_ts
+        };
+        if event.start_ts >= end_ts || event_end <= start_ts {
+            continue;
+        }
+
+        let clipped_start = event.start_ts.max(start_ts);
+        let clipped_end = event_end.min(end_ts);
+        let row = storage::EventRow {
+            id: -((index as i64) + 1),
+            start_ts: clipped_start,
+            end_ts: clipped_end,
+            app: event.app,
+            bundle_id: event.bundle_id,
+            window_title: event.window_title,
+            duration_ms: (clipped_end - clipped_start) * 1000,
+            ongoing: runtime_event.ongoing,
+        };
+        if seen.insert(event_key(&row)) {
+            rows.push(row);
+        }
+    }
+}
+
+type EventKey = (i64, i64, String, String, Option<String>);
+
+fn event_key(event: &storage::EventRow) -> EventKey {
+    (
+        event.start_ts,
+        event.end_ts,
+        event.app.clone(),
+        event.bundle_id.clone(),
+        event.window_title.clone(),
+    )
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// 今天日期字符串 "YYYY-MM-DD"（本地时间，UTC+8）
 fn today_str() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = now_secs();
     let local = now + 8 * 3600; // UTC+8
     let days = local / 86400;
     let remainder = local % 86400;
@@ -205,9 +321,16 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let paused = Arc::new(AtomicBool::new(false));
+    let (pause_tx, pause_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+    let runtime_events: collector::SharedRuntimeEvents = Arc::new(Mutex::new(Vec::new()));
 
-    tauri::Builder::default()
-        .manage(PausedState(paused.clone()))
+    let app = tauri::Builder::default()
+        .manage(PausedState {
+            current: paused.clone(),
+            changes: pause_tx,
+        })
         .setup(move |app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -228,14 +351,19 @@ pub fn run() {
             seed_default_blacklist(&storage);
 
             // Storage 注册为 Tauri 状态供命令使用
-            app.manage(AppState { storage });
+            app.manage(AppState {
+                storage,
+                runtime_events: runtime_events.clone(),
+            });
 
             // 启动采集后台任务（tokio 运行时由 tauri 管理）
-            let paused_clone = paused.clone();
             tauri::async_runtime::spawn(async move {
                 collector::Collector::new(
                     storage::Storage::open(&db_path).expect("reopen db"),
-                    paused_clone,
+                    pause_rx,
+                    shutdown_rx,
+                    shutdown_done_tx,
+                    runtime_events,
                 )
                 .run()
                 .await;
@@ -257,8 +385,28 @@ pub fn run() {
             open_accessibility_settings,
             get_active_app_info
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let mut shutdown_done_rx = Some(shutdown_done_rx);
+    app.run(move |app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if !shutdown_started.swap(true, Ordering::SeqCst) {
+                api.prevent_exit();
+                let _ = shutdown_tx.send(true);
+                if let Some(done_rx) = shutdown_done_rx.take() {
+                    let app_handle = app_handle.clone();
+                    std::thread::spawn(move || {
+                        if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                            log::warn!("[collector] 退出 flush 超时，继续退出");
+                        }
+                        app_handle.exit(0);
+                    });
+                }
+            }
+        }
+    });
 }
 
 /// 首次启动时填充默认黑名单（表为空才插入）
@@ -277,4 +425,66 @@ fn seed_default_blacklist(storage: &storage::Storage) {
         let _ = storage.add_blacklist(bundle_id, app_name);
     }
     log::info!("[storage] 已填充默认黑名单 {} 项", defaults.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::merger::{MergedEvent, RuntimeEvent};
+
+    fn row(id: i64, start_ts: i64, end_ts: i64) -> storage::EventRow {
+        storage::EventRow {
+            id,
+            start_ts,
+            end_ts,
+            app: "Editor".to_string(),
+            bundle_id: "com.test.editor".to_string(),
+            window_title: Some("file".to_string()),
+            duration_ms: (end_ts - start_ts) * 1000,
+            ongoing: false,
+        }
+    }
+
+    fn runtime(start_ts: i64, end_ts: i64, ongoing: bool) -> RuntimeEvent {
+        RuntimeEvent {
+            event: MergedEvent {
+                app: "Editor".to_string(),
+                bundle_id: "com.test.editor".to_string(),
+                window_title: Some("file".to_string()),
+                start_ts,
+                end_ts,
+                duration_ms: (end_ts - start_ts) * 1000,
+            },
+            ongoing,
+        }
+    }
+
+    #[test]
+    fn runtime_merge_deduplicates_pending_database_event() {
+        let mut rows = vec![row(1, 100, 110)];
+        merge_runtime_events(&mut rows, vec![runtime(100, 110, false)], 100, 200, 150);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1);
+    }
+
+    #[test]
+    fn runtime_merge_extends_and_clips_ongoing_event() {
+        let mut rows = Vec::new();
+        merge_runtime_events(&mut rows, vec![runtime(90, 120, true)], 100, 200, 150);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].start_ts, rows[0].end_ts), (100, 150));
+        assert_eq!(rows[0].duration_ms, 50_000);
+        assert!(rows[0].ongoing);
+    }
+
+    #[test]
+    fn runtime_merge_includes_previous_day_part_of_ongoing_event() {
+        let mut rows = Vec::new();
+        merge_runtime_events(&mut rows, vec![runtime(90, 120, true)], 0, 100, 150);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].start_ts, rows[0].end_ts), (90, 100));
+        assert_eq!(rows[0].duration_ms, 10_000);
+    }
 }

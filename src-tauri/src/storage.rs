@@ -13,7 +13,7 @@ use rusqlite::{params, Connection};
 use crate::merger::MergedEvent;
 
 /// 查询返回的事件（供前端展示）
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct EventRow {
     pub id: i64,
     pub start_ts: i64,
@@ -22,6 +22,7 @@ pub struct EventRow {
     pub bundle_id: String,
     pub window_title: Option<String>,
     pub duration_ms: i64,
+    pub ongoing: bool,
 }
 
 /// 查询返回的日报/周报（供前端展示）
@@ -72,6 +73,7 @@ impl Storage {
                 created_at   INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_start_ts ON events(start_ts);
+            CREATE INDEX IF NOT EXISTS idx_events_end_ts ON events(end_ts);
 
             CREATE TABLE IF NOT EXISTS blacklist (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,25 +138,30 @@ impl Storage {
         conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
     }
 
-    /// 查询某天 [start, end) 时间范围内的事件，按开始时间倒序返回。
+    /// 查询与 [start, end) 相交的事件，按范围边界裁剪后倒序返回。
     /// `start_ts` / `end_ts` 为 Unix 秒（本地 0 点 ~ 次日 0 点）。
     pub fn query_events(&self, start_ts: i64, end_ts: i64) -> rusqlite::Result<Vec<EventRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, start_ts, end_ts, app, bundle_id, window_title, duration_ms
              FROM events
-             WHERE start_ts >= ?1 AND start_ts < ?2
+             WHERE start_ts < ?2 AND end_ts > ?1
              ORDER BY start_ts DESC",
         )?;
         let rows = stmt.query_map(params![start_ts, end_ts], |row| {
+            let stored_start: i64 = row.get(1)?;
+            let stored_end: i64 = row.get(2)?;
+            let clipped_start = stored_start.max(start_ts);
+            let clipped_end = stored_end.min(end_ts);
             Ok(EventRow {
                 id: row.get(0)?,
-                start_ts: row.get(1)?,
-                end_ts: row.get(2)?,
+                start_ts: clipped_start,
+                end_ts: clipped_end,
                 app: row.get(3)?,
                 bundle_id: row.get(4)?,
                 window_title: row.get(5)?,
-                duration_ms: row.get(6)?,
+                duration_ms: (clipped_end - clipped_start) * 1000,
+                ongoing: false,
             })
         })?;
         rows.collect()
@@ -197,9 +204,11 @@ impl Storage {
         };
         let mut stmt = conn.prepare(sql)?;
         let rows = if let Some(date) = period_date {
-            stmt.query_map(params![report_type, date], map_report_row)?.collect()
+            stmt.query_map(params![report_type, date], map_report_row)?
+                .collect()
         } else {
-            stmt.query_map(params![report_type], map_report_row)?.collect()
+            stmt.query_map(params![report_type], map_report_row)?
+                .collect()
         };
         rows
     }
@@ -235,7 +244,10 @@ impl Storage {
     /// 删除黑名单项
     pub fn remove_blacklist(&self, bundle_id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM blacklist WHERE bundle_id = ?1", params![bundle_id])?;
+        conn.execute(
+            "DELETE FROM blacklist WHERE bundle_id = ?1",
+            params![bundle_id],
+        )?;
         Ok(())
     }
 
@@ -266,4 +278,69 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_db_path(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "workdaily-{}-{}-{}.db",
+            test_name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn query_events_includes_and_clips_crossing_events() {
+        let path = temporary_db_path("cross-day");
+        let storage = Storage::open(&path).unwrap();
+        storage
+            .insert_events(&[
+                MergedEvent {
+                    app: "Before".to_string(),
+                    bundle_id: "com.test.before".to_string(),
+                    window_title: None,
+                    start_ts: 90,
+                    end_ts: 110,
+                    duration_ms: 20_000,
+                },
+                MergedEvent {
+                    app: "After".to_string(),
+                    bundle_id: "com.test.after".to_string(),
+                    window_title: None,
+                    start_ts: 190,
+                    end_ts: 210,
+                    duration_ms: 20_000,
+                },
+                MergedEvent {
+                    app: "Outside".to_string(),
+                    bundle_id: "com.test.outside".to_string(),
+                    window_title: None,
+                    start_ts: 10,
+                    end_ts: 20,
+                    duration_ms: 10_000,
+                },
+            ])
+            .unwrap();
+
+        let rows = storage.query_events(100, 200).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].start_ts, rows[0].end_ts), (190, 200));
+        assert_eq!(rows[0].duration_ms, 10_000);
+        assert_eq!((rows[1].start_ts, rows[1].end_ts), (100, 110));
+        assert_eq!(rows[1].duration_ms, 10_000);
+        assert!(rows.iter().all(|row| !row.ongoing));
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
 }
