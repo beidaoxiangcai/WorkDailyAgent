@@ -201,6 +201,7 @@ fn query_day_events(
         .map_err(|e| format!("读取运行态失败: {}", e))?
         .clone();
     merge_runtime_events(&mut rows, runtime, start_ts, end_ts, now);
+    rows = normalize_idle_events(rows);
 
     rows.sort_by(|a, b| {
         b.start_ts
@@ -208,6 +209,103 @@ fn query_day_events(
             .then_with(|| b.end_ts.cmp(&a.end_ts))
     });
     Ok(rows)
+}
+
+fn normalize_idle_events(rows: Vec<storage::EventRow>) -> Vec<storage::EventRow> {
+    let (mut idle_rows, mut regular_rows): (Vec<_>, Vec<_>) =
+        rows.into_iter().partition(is_idle_row);
+    if idle_rows.is_empty() {
+        return regular_rows;
+    }
+
+    let occupied_ranges = merge_ranges(
+        regular_rows
+            .iter()
+            .map(|row| (row.start_ts, row.end_ts))
+            .collect(),
+    );
+
+    idle_rows.sort_by(|a, b| {
+        a.start_ts
+            .cmp(&b.start_ts)
+            .then_with(|| a.end_ts.cmp(&b.end_ts))
+    });
+    let mut merged_idle: Vec<storage::EventRow> = Vec::new();
+    for row in idle_rows {
+        if let Some(previous) = merged_idle.last_mut() {
+            if row.start_ts <= previous.end_ts {
+                previous.end_ts = previous.end_ts.max(row.end_ts);
+                previous.duration_ms = (previous.end_ts - previous.start_ts) * 1000;
+                previous.ongoing |= row.ongoing;
+                if previous.id <= 0 && row.id > 0 {
+                    previous.id = row.id;
+                }
+                continue;
+            }
+        }
+        merged_idle.push(row);
+    }
+
+    for idle in merged_idle {
+        for (start_ts, end_ts) in subtract_ranges(idle.start_ts, idle.end_ts, &occupied_ranges) {
+            regular_rows.push(storage::EventRow {
+                id: idle.id,
+                start_ts,
+                end_ts,
+                app: idle.app.clone(),
+                bundle_id: idle.bundle_id.clone(),
+                window_title: idle.window_title.clone(),
+                duration_ms: (end_ts - start_ts) * 1000,
+                ongoing: idle.ongoing && end_ts == idle.end_ts,
+            });
+        }
+    }
+
+    regular_rows
+}
+
+fn is_idle_row(row: &storage::EventRow) -> bool {
+    row.app == "(空闲)" || (row.bundle_id.is_empty() && row.app == "系统空闲")
+}
+
+fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.retain(|(start, end)| end > start);
+    ranges.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if start <= previous.1 {
+                previous.1 = previous.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn subtract_ranges(start_ts: i64, end_ts: i64, occupied: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut cursor = start_ts;
+    let mut remaining = Vec::new();
+    for &(occupied_start, occupied_end) in occupied {
+        if occupied_end <= cursor {
+            continue;
+        }
+        if occupied_start >= end_ts {
+            break;
+        }
+        if occupied_start > cursor {
+            remaining.push((cursor, occupied_start.min(end_ts)));
+        }
+        cursor = cursor.max(occupied_end);
+        if cursor >= end_ts {
+            return remaining;
+        }
+    }
+    if cursor < end_ts {
+        remaining.push((cursor, end_ts));
+    }
+    remaining
 }
 
 fn merge_runtime_events(
@@ -445,6 +543,19 @@ mod tests {
         }
     }
 
+    fn idle_row(id: i64, start_ts: i64, end_ts: i64) -> storage::EventRow {
+        storage::EventRow {
+            id,
+            start_ts,
+            end_ts,
+            app: "(空闲)".to_string(),
+            bundle_id: String::new(),
+            window_title: Some("系统空闲".to_string()),
+            duration_ms: (end_ts - start_ts) * 1000,
+            ongoing: false,
+        }
+    }
+
     fn runtime(start_ts: i64, end_ts: i64, ongoing: bool) -> RuntimeEvent {
         RuntimeEvent {
             event: MergedEvent {
@@ -486,5 +597,47 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].start_ts, rows[0].end_ts), (90, 100));
         assert_eq!(rows[0].duration_ms, 10_000);
+    }
+
+    #[test]
+    fn idle_normalization_merges_history_and_excludes_regular_events() {
+        let rows = vec![
+            idle_row(1, 0, 100),
+            idle_row(2, 0, 200),
+            idle_row(3, 150, 250),
+            row(4, 160, 180),
+        ];
+
+        let mut normalized = normalize_idle_events(rows);
+        normalized.sort_by_key(|event| event.start_ts);
+
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|event| (event.app.as_str(), event.start_ts, event.end_ts))
+                .collect::<Vec<_>>(),
+            vec![
+                ("(空闲)", 0, 160),
+                ("Editor", 160, 180),
+                ("(空闲)", 180, 250),
+            ]
+        );
+        assert_eq!(
+            normalized
+                .iter()
+                .filter(|event| event.app == "(空闲)")
+                .map(|event| event.duration_ms)
+                .sum::<i64>(),
+            230_000
+        );
+    }
+
+    #[test]
+    fn idle_normalization_merges_adjacent_ranges() {
+        let normalized = normalize_idle_events(vec![idle_row(1, 100, 150), idle_row(2, 150, 200)]);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!((normalized[0].start_ts, normalized[0].end_ts), (100, 200));
+        assert_eq!(normalized[0].duration_ms, 100_000);
     }
 }

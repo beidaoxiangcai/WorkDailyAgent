@@ -110,25 +110,59 @@ impl Storage {
         let tx = conn.unchecked_transaction()?;
         let mut count = 0;
         for event in events {
-            tx.execute(
-                "INSERT INTO events
-                    (start_ts, end_ts, app, bundle_id, window_title, duration_ms, source, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    event.start_ts,
-                    event.end_ts,
-                    event.app,
-                    event.bundle_id,
-                    event.window_title,
-                    event.duration_ms,
-                    "system",
-                    now,
-                ],
-            )?;
-            count += 1;
+            let ranges = if is_idle_event(event) {
+                let covered = {
+                    let mut stmt = tx.prepare(
+                        "SELECT start_ts, end_ts
+                         FROM events
+                         WHERE (app = '(空闲)' OR (app = '系统空闲' AND bundle_id = ''))
+                           AND start_ts < ?2 AND end_ts > ?1
+                         ORDER BY start_ts, end_ts",
+                    )?;
+                    let ranges = stmt
+                        .query_map(params![event.start_ts, event.end_ts], |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
+                    ranges
+                };
+                subtract_covered_ranges(event.start_ts, event.end_ts, &covered)
+            } else {
+                vec![(event.start_ts, event.end_ts)]
+            };
+
+            for (start_ts, end_ts) in ranges {
+                tx.execute(
+                    "INSERT INTO events
+                        (start_ts, end_ts, app, bundle_id, window_title, duration_ms, source, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        start_ts,
+                        end_ts,
+                        event.app,
+                        event.bundle_id,
+                        event.window_title,
+                        (end_ts - start_ts) * 1000,
+                        "system",
+                        now,
+                    ],
+                )?;
+                count += 1;
+            }
         }
         tx.commit()?;
         Ok(count)
+    }
+
+    /// 返回指定时间之前数据库已经记录到的最晚时间点。
+    pub fn latest_recorded_ts(&self, at_ts: i64) -> rusqlite::Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT MAX(CASE WHEN end_ts > ?1 THEN ?1 ELSE end_ts END)
+             FROM events WHERE start_ts < ?1",
+            params![at_ts],
+            |row| row.get(0),
+        )
     }
 
     /// 查询 WAL 模式状态（自测用）
@@ -280,6 +314,44 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn is_idle_event(event: &MergedEvent) -> bool {
+    event.app == "(空闲)" || (event.bundle_id.is_empty() && event.app == "系统空闲")
+}
+
+fn subtract_covered_ranges(start_ts: i64, end_ts: i64, covered: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    if end_ts <= start_ts {
+        return Vec::new();
+    }
+
+    let mut remaining = vec![(start_ts, end_ts)];
+    for &(covered_start, covered_end) in covered {
+        if covered_end <= covered_start {
+            continue;
+        }
+        remaining = remaining
+            .into_iter()
+            .flat_map(|(start, end)| {
+                if covered_end <= start || covered_start >= end {
+                    return vec![(start, end)];
+                }
+
+                let mut fragments = Vec::with_capacity(2);
+                if start < covered_start {
+                    fragments.push((start, covered_start.min(end)));
+                }
+                if covered_end < end {
+                    fragments.push((covered_end.max(start), end));
+                }
+                fragments
+            })
+            .collect();
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    remaining
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +366,17 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn idle(start_ts: i64, end_ts: i64) -> MergedEvent {
+        MergedEvent {
+            app: "(空闲)".to_string(),
+            bundle_id: String::new(),
+            window_title: Some("系统空闲".to_string()),
+            start_ts,
+            end_ts,
+            duration_ms: (end_ts - start_ts) * 1000,
+        }
     }
 
     #[test]
@@ -337,6 +420,33 @@ mod tests {
         assert_eq!((rows[1].start_ts, rows[1].end_ts), (100, 110));
         assert_eq!(rows[1].duration_ms, 10_000);
         assert!(rows.iter().all(|row| !row.ongoing));
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn insert_events_only_writes_uncovered_idle_ranges() {
+        let path = temporary_db_path("idle-overlap");
+        let storage = Storage::open(&path).unwrap();
+
+        assert_eq!(storage.insert_events(&[idle(100, 200)]).unwrap(), 1);
+        assert_eq!(storage.insert_events(&[idle(100, 250)]).unwrap(), 1);
+        assert_eq!(storage.insert_events(&[idle(50, 300)]).unwrap(), 2);
+
+        let mut rows = storage.query_events(0, 400).unwrap();
+        rows.sort_by_key(|row| row.start_ts);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.start_ts, row.end_ts))
+                .collect::<Vec<_>>(),
+            vec![(50, 100), (100, 200), (200, 250), (250, 300)]
+        );
+        assert_eq!(rows.iter().map(|row| row.duration_ms).sum::<i64>(), 250_000);
+        assert_eq!(storage.latest_recorded_ts(275).unwrap(), Some(275));
+        assert_eq!(storage.latest_recorded_ts(40).unwrap(), None);
 
         drop(storage);
         let _ = std::fs::remove_file(&path);

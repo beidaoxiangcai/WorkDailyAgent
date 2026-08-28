@@ -76,6 +76,8 @@ pub struct Merger {
     is_idle: bool,
     /// 空闲开始时间戳（最后一次实际活动时间）
     idle_start_ts: Option<i64>,
+    /// 已处理到的时间水位，防止系统空闲时间回溯后重复生成历史区间。
+    recorded_until_ts: i64,
     /// 去抖动阈值（秒）：A→B→A 间隔 ≤ 此值则合并
     debounce_secs: i64,
 }
@@ -88,8 +90,14 @@ impl Merger {
             completed: Vec::new(),
             is_idle: false,
             idle_start_ts: None,
+            recorded_until_ts: 0,
             debounce_secs: 3,
         }
+    }
+
+    /// 使用存储层最后一条事件的结束时间初始化采集水位。
+    pub fn initialize_recorded_until(&mut self, recorded_until_ts: i64) {
+        self.recorded_until_ts = self.recorded_until_ts.max(recorded_until_ts);
     }
 
     /// 处理一条 RawEvent。
@@ -112,7 +120,7 @@ impl Merger {
                 if idle_end > start {
                     let duration_ms = (idle_end - start) * 1000;
                     info!("[merger] 空闲结束: {}s，生成空闲事件", duration_ms / 1000);
-                    self.completed.push(idle_event(start, idle_end));
+                    self.push_completed(idle_event(start, idle_end));
                 }
             }
             info!("[merger] 用户恢复活动，开始新事件");
@@ -195,24 +203,21 @@ impl Merger {
     pub fn force_boundary(&mut self, at_ts: i64) {
         if let Some(p) = self.prev.take() {
             let event = p.close();
-            if event.duration_ms > 0 {
-                self.completed.push(event);
-            }
+            self.push_completed(event);
         }
         if let Some(c) = self.current.take() {
             let event = c.close_at(at_ts);
-            if event.duration_ms > 0 {
-                self.completed.push(event);
-            }
+            self.push_completed(event);
         }
         if self.is_idle {
             if let Some(start_ts) = self.idle_start_ts.take() {
                 if at_ts > start_ts {
-                    self.completed.push(idle_event(start_ts, at_ts));
+                    self.push_completed(idle_event(start_ts, at_ts));
                 }
             }
             self.is_idle = false;
         }
+        self.recorded_until_ts = self.recorded_until_ts.max(at_ts);
     }
 
     /// 闭合所有未完成事件（用于退出时 flush）。
@@ -279,15 +284,14 @@ impl Merger {
                 event.end_ts,
                 event.duration_ms / 1000
             );
-            self.completed.push(event);
+            self.push_completed(event);
         }
     }
 
     fn enter_idle(&mut self, now: i64, idle_secs: f64) {
         self.is_idle = true;
         // 最后一次实际活动时间 = 当前时间 - 空闲时长
-        let last_activity = (now - idle_secs as i64).max(0);
-        self.idle_start_ts = Some(last_activity);
+        let last_activity = (now - idle_secs as i64).clamp(0, now);
 
         // 闭合当前事件，end_ts 修正为最后一次实际活动时间
         if let Some(cur) = self.current.take() {
@@ -300,14 +304,24 @@ impl Merger {
                 event.app,
                 event.duration_ms / 1000
             );
-            if event.duration_ms > 0 {
-                self.completed.push(event);
-            }
+            self.push_completed(event);
         }
         // prev 中暂存的事件也一并闭合
         if let Some(p) = self.prev.take() {
-            self.completed.push(p.close());
+            self.push_completed(p.close());
         }
+
+        // 显示器可能在没有新 HID 输入时反复睡眠/唤醒，此时系统返回的
+        // last_activity 不变。水位保证新的空闲区间不会回溯覆盖已记录数据。
+        self.idle_start_ts = Some(last_activity.max(self.recorded_until_ts));
+    }
+
+    fn push_completed(&mut self, event: MergedEvent) {
+        if event.duration_ms <= 0 || event.end_ts <= event.start_ts {
+            return;
+        }
+        self.recorded_until_ts = self.recorded_until_ts.max(event.end_ts);
+        self.completed.push(event);
     }
 }
 
@@ -397,5 +411,38 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].end_ts, 109);
         assert_eq!(completed[0].duration_ms, 9_000);
+    }
+
+    #[test]
+    fn repeated_sleep_without_new_input_does_not_repeat_idle_history() {
+        let mut merger = Merger::new();
+        merger.on_event(&raw(100, "Editor", "file"), 0.0, false);
+
+        merger.on_event(&raw(200, "loginwindow", "login"), 100.0, true);
+        merger.on_event(&raw(300, "loginwindow", "login"), 200.0, false);
+        merger.on_event(&raw(310, "loginwindow", "login"), 210.0, true);
+        merger.on_event(&raw(400, "loginwindow", "login"), 300.0, false);
+
+        let idle = merger
+            .drain_completed()
+            .into_iter()
+            .filter(|event| event.app == "(空闲)")
+            .collect::<Vec<_>>();
+        assert_eq!(idle.len(), 2);
+        assert_eq!((idle[0].start_ts, idle[0].end_ts), (100, 300));
+        assert_eq!((idle[1].start_ts, idle[1].end_ts), (300, 400));
+    }
+
+    #[test]
+    fn restored_watermark_prevents_idle_backfill_after_restart() {
+        let mut merger = Merger::new();
+        merger.initialize_recorded_until(250);
+
+        merger.on_event(&raw(300, "loginwindow", "login"), 200.0, true);
+        merger.on_event(&raw(400, "loginwindow", "login"), 300.0, false);
+
+        let completed = merger.drain_completed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!((completed[0].start_ts, completed[0].end_ts), (250, 400));
     }
 }

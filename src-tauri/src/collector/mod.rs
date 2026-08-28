@@ -72,6 +72,15 @@ impl Collector {
 
     /// 启动采集循环。在 tauri 的异步运行时（tokio）上跑。
     pub async fn run(mut self) {
+        match self.storage.latest_recorded_ts(now_secs()) {
+            Ok(Some(recorded_until_ts)) => {
+                self.merger.initialize_recorded_until(recorded_until_ts);
+                info!("[collector] 采集时间水位已恢复: {}", recorded_until_ts);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("[collector] 恢复采集时间水位失败: {}", e),
+        }
+
         // 启动时从 SQLite 加载黑名单
         self.reload_blacklist();
 
@@ -120,10 +129,13 @@ impl Collector {
                     self.flush_completed();
                 }
                 changed = self.pause_rx.changed() => {
-                    if changed.is_ok() && *self.pause_rx.borrow() {
-                        self.merger.force_boundary(now_secs());
+                    if changed.is_ok() {
+                        let boundary_ts = now_secs();
+                        self.merger.force_boundary(boundary_ts);
                         self.publish_runtime(now_secs());
-                        self.flush_completed();
+                        if *self.pause_rx.borrow() {
+                            self.flush_completed();
+                        }
                     }
                 }
                 changed = self.shutdown_rx.changed() => {

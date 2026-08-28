@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import './App.css'
+import ActivityAnalysisPage from './ActivityAnalysisPage'
 
 // ── Rust 后端返回的结构 ──
 interface EventRow {
@@ -36,9 +37,10 @@ interface ActiveAppInfo {
 }
 
 // ── 导航项 ──
-type Page = 'timeline' | 'reports' | 'settings'
+type Page = 'timeline' | 'activity' | 'reports' | 'settings'
 const NAV_ITEMS: { key: Page; label: string }[] = [
   { key: 'timeline', label: '时间轴' },
+  { key: 'activity', label: '活动分析' },
   { key: 'reports', label: '日报/周报' },
   { key: 'settings', label: '设置' },
 ]
@@ -201,6 +203,7 @@ function App() {
             generating={generating}
           />
         )}
+        {page === 'activity' && <ActivityAnalysisPage />}
         {page === 'reports' && <ReportsPage refreshTrigger={reportTrigger} />}
         {page === 'settings' && <SettingsPage />}
       </main>
