@@ -102,8 +102,9 @@ async fn save_and_verify_api_key(api_key: String) -> Result<secret_store::ApiKey
 }
 
 #[tauri::command]
-fn delete_api_key() -> Result<secret_store::ApiKeyStatus, String> {
+async fn delete_api_key() -> Result<secret_store::ApiKeyStatus, String> {
     secret_store::delete_api_key()?;
+    log::info!("[settings] DeepSeek API Key 已从 Keychain 移除");
     secret_store::get_api_key_status()
 }
 

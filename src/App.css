@@ -224,6 +224,23 @@
 .secondary-btn:hover {
   background: var(--bg-soft);
 }
+.delete-confirm-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  background: var(--red);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.delete-confirm-btn:hover {
+  opacity: 0.9;
+}
+.delete-confirm-btn:disabled,
+.secondary-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
 .generate-btn-sm {
   padding: 6px 12px;
   border-radius: 6px;

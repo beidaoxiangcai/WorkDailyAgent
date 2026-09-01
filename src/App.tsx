@@ -498,6 +498,8 @@ function SettingsPage({ focusApiKeyRequest }: { focusApiKeyRequest: number }) {
   const [apiKey, setApiKey] = useState('')
   const [showApiKey, setShowApiKey] = useState(false)
   const [savingApiKey, setSavingApiKey] = useState(false)
+  const [deleteApiKeyConfirmOpen, setDeleteApiKeyConfirmOpen] = useState(false)
+  const [deletingApiKey, setDeletingApiKey] = useState(false)
   const [apiKeyFeedback, setApiKeyFeedback] = useState<{
     type: 'success' | 'error'
     message: string
@@ -566,7 +568,7 @@ function SettingsPage({ focusApiKeyRequest }: { focusApiKeyRequest: number }) {
   }
 
   const handleDeleteApiKey = async () => {
-    if (!confirm('确定要移除已保存的 DeepSeek API Key 吗？')) return
+    setDeletingApiKey(true)
     setApiKeyFeedback(null)
     try {
       const status = await invoke<ApiKeyStatus>('delete_api_key')
@@ -575,6 +577,9 @@ function SettingsPage({ focusApiKeyRequest }: { focusApiKeyRequest: number }) {
       setApiKeyFeedback({ type: 'success', message: '已移除钥匙串中的 API Key' })
     } catch (e) {
       setApiKeyFeedback({ type: 'error', message: String(e) })
+    } finally {
+      setDeletingApiKey(false)
+      setDeleteApiKeyConfirmOpen(false)
     }
   }
 
@@ -681,7 +686,7 @@ function SettingsPage({ focusApiKeyRequest }: { focusApiKeyRequest: number }) {
               )}
             </div>
             {apiKeyStatus?.source === 'keychain' && (
-              <button className="delete-btn" onClick={handleDeleteApiKey}>
+              <button className="delete-btn" onClick={() => setDeleteApiKeyConfirmOpen(true)}>
                 移除密钥
               </button>
             )}
@@ -770,6 +775,40 @@ function SettingsPage({ focusApiKeyRequest }: { focusApiKeyRequest: number }) {
           </button>
         </div>
       </div>
+
+      {deleteApiKeyConfirmOpen && (
+        <div className="dialog-backdrop" role="presentation">
+          <div
+            className="dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-api-key-dialog-title"
+            aria-describedby="delete-api-key-dialog-description"
+          >
+            <h2 id="delete-api-key-dialog-title">移除 API Key？</h2>
+            <p id="delete-api-key-dialog-description">
+              Key 将从 macOS 钥匙串中删除，之后需要重新配置才能生成日报。
+            </p>
+            <div className="dialog-actions">
+              <button
+                className="secondary-btn"
+                onClick={() => setDeleteApiKeyConfirmOpen(false)}
+                disabled={deletingApiKey}
+              >
+                取消
+              </button>
+              <button
+                className="delete-confirm-btn"
+                onClick={handleDeleteApiKey}
+                disabled={deletingApiKey}
+                autoFocus
+              >
+                {deletingApiKey ? '移除中…' : '确认移除'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   )
 }
