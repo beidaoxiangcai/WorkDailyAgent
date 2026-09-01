@@ -37,5 +37,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # S4: HTTP 客户端（调 DeepSeek API）；rustls-tls 避免系统 OpenSSL 依赖
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
+# S7: 使用 macOS Keychain 保存 DeepSeek API Key
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
 [features]
 # 默认 custom-protocol 由 tauri 注入

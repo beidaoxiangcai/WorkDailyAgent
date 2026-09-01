@@ -1,6 +1,7 @@
 mod collector;
 mod generator;
 mod merger;
+mod secret_store;
 mod storage;
 
 use std::collections::HashSet;
@@ -10,6 +11,8 @@ use std::time::Duration;
 
 use tauri::Manager;
 use tokio::sync::watch;
+
+const API_KEY_NOT_CONFIGURED: &str = "API_KEY_NOT_CONFIGURED";
 
 /// 共享暂停状态（前端通过命令切换）
 struct PausedState {
@@ -34,6 +37,9 @@ async fn generate_daily_report(
     date: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    let api_key = secret_store::resolve_api_key()?
+        .ok_or_else(|| API_KEY_NOT_CONFIGURED.to_string())?
+        .value;
     let target_date = date.unwrap_or_else(today_str);
     let (start_ts, end_ts) =
         parse_day_range(&target_date).ok_or_else(|| format!("无效日期: {}", target_date))?;
@@ -49,7 +55,7 @@ async fn generate_daily_report(
     }
 
     // 生成日报内容
-    let report = generator::generate_daily_report(&events).await;
+    let report = generator::generate_daily_report(&events, &api_key).await;
 
     // 存入 reports 表
     let event_ids = serde_json::to_string(
@@ -74,6 +80,31 @@ async fn generate_daily_report(
 
     log::info!("[generator] 日报已保存，日期={}", target_date);
     Ok(report.content)
+}
+
+// ── DeepSeek API Key ──
+
+#[tauri::command]
+fn get_api_key_status() -> Result<secret_store::ApiKeyStatus, String> {
+    secret_store::get_api_key_status()
+}
+
+#[tauri::command]
+async fn save_and_verify_api_key(api_key: String) -> Result<secret_store::ApiKeyStatus, String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("请输入 API Key".to_string());
+    }
+
+    generator::validate_api_key(api_key).await?;
+    secret_store::save_api_key(api_key)?;
+    secret_store::get_api_key_status()
+}
+
+#[tauri::command]
+fn delete_api_key() -> Result<secret_store::ApiKeyStatus, String> {
+    secret_store::delete_api_key()?;
+    secret_store::get_api_key_status()
 }
 
 /// 查询日报/周报列表。type="daily"|"weekly"，可选 date 筛选。
@@ -474,6 +505,9 @@ pub fn run() {
             set_paused,
             is_paused,
             generate_daily_report,
+            get_api_key_status,
+            save_and_verify_api_key,
+            delete_api_key,
             get_reports,
             get_blacklist,
             add_blacklist,

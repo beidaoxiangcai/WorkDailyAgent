@@ -1,7 +1,7 @@
 //! 日报生成模块：组装 Prompt → 调 DeepSeek API → 解析返回 → 失败降级模板填充。
 //!
-//! - API Key 通过环境变量 `DEEPSEEK_API_KEY` 配置
-//! - 无 Key 或 API 失败时，降级为规则模板（应用名 + 时长列表）
+//! - API Key 由调用方从 Keychain 或环境变量解析后传入
+//! - API 失败时，降级为规则模板（应用名 + 时长列表）
 //! - 隐私：只传应用名 + 时长 + 窗口标题，不传原始文件内容
 
 use log::{info, warn};
@@ -9,7 +9,7 @@ use log::{info, warn};
 use crate::storage::EventRow;
 
 const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/chat/completions";
-const DEEPSEEK_MODEL: &str = "deepseek-chat";
+const DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 
 /// 生成日报结果
 pub struct GeneratedReport {
@@ -18,7 +18,7 @@ pub struct GeneratedReport {
 }
 
 /// 生成今日日报：事件列表 → 时间线文本 → LLM（或降级模板）
-pub async fn generate_daily_report(events: &[EventRow]) -> GeneratedReport {
+pub async fn generate_daily_report(events: &[EventRow], api_key: &str) -> GeneratedReport {
     if events.is_empty() {
         return GeneratedReport {
             content: "今日无采集事件，无法生成日报。".to_string(),
@@ -29,7 +29,7 @@ pub async fn generate_daily_report(events: &[EventRow]) -> GeneratedReport {
     let timeline = build_timeline(events);
 
     // 尝试调 LLM
-    match call_deepseek(&timeline).await {
+    match call_deepseek(&timeline, api_key).await {
         Ok(content) => {
             info!("[generator] LLM 日报生成成功，长度 {} 字", content.len());
             GeneratedReport {
@@ -66,11 +66,9 @@ fn build_timeline(events: &[EventRow]) -> String {
 }
 
 /// 调 DeepSeek API（OpenAI 兼容协议）
-async fn call_deepseek(timeline: &str) -> Result<String, String> {
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .map_err(|_| "未设置 DEEPSEEK_API_KEY 环境变量".to_string())?;
-
-    let system_prompt = "你是一个工作日报助手。根据用户今日的电脑活动时间线，生成\"今日完成\"部分。\n\
+async fn call_deepseek(timeline: &str, api_key: &str) -> Result<String, String> {
+    let system_prompt =
+        "你是一个工作日报助手。根据用户今日的电脑活动时间线，生成\"今日完成\"部分。\n\
         要求：\n\
         1. 严格基于时间线中真实出现过的应用名和窗口标题，不得编造、臆测或联想未出现的应用或活动。\n\
         2. 按项目或时间组织，2~5 条，精炼自然，突出关键产出。\n\
@@ -91,7 +89,7 @@ async fn call_deepseek(timeline: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
     let resp = client
         .post(DEEPSEEK_API_URL)
-        .bearer_auth(&api_key)
+        .bearer_auth(api_key)
         .json(&body)
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -100,8 +98,7 @@ async fn call_deepseek(timeline: &str) -> Result<String, String> {
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {}: {}", status, text));
+        return Err(provider_error(status.as_u16()));
     }
 
     let json: serde_json::Value = resp
@@ -113,6 +110,44 @@ async fn call_deepseek(timeline: &str) -> Result<String, String> {
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| "响应中无 content 字段".to_string())
+}
+
+/// 用最小生成请求验证候选 Key；验证成功后调用方才会写入 Keychain。
+pub async fn validate_api_key(api_key: &str) -> Result<(), String> {
+    let body = serde_json::json!({
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            { "role": "user", "content": "回复 OK" },
+        ],
+        "thinking": { "type": "disabled" },
+        "max_tokens": 4,
+        "stream": false,
+    });
+
+    let resp = reqwest::Client::new()
+        .post(DEEPSEEK_API_URL)
+        .bearer_auth(api_key)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|_| "无法连接 DeepSeek，请检查网络后重试".to_string())?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(provider_error(resp.status().as_u16()))
+    }
+}
+
+fn provider_error(status: u16) -> String {
+    match status {
+        401 => "API Key 无效，请检查后重试".to_string(),
+        402 => "DeepSeek 账户余额不足".to_string(),
+        429 => "DeepSeek 请求过于频繁，请稍后重试".to_string(),
+        500 | 503 => "DeepSeek 服务暂时不可用，请稍后重试".to_string(),
+        _ => format!("DeepSeek 请求失败（HTTP {}）", status),
+    }
 }
 
 /// 降级模板：LLM 失败时用规则生成
@@ -135,7 +170,10 @@ fn fallback_template(events: &[EventRow]) -> String {
         lines.push(format!("- {}", detail));
     }
 
-    lines.push(format!("\n（总活动时长 {}）", format_duration(total_mins * 60000)));
+    lines.push(format!(
+        "\n（总活动时长 {}）",
+        format_duration(total_mins * 60000)
+    ));
     lines.join("\n")
 }
 

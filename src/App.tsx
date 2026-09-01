@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import './App.css'
 import ActivityAnalysisPage from './ActivityAnalysisPage'
@@ -35,6 +35,14 @@ interface ActiveAppInfo {
   app_name: string
   window_title: string | null
 }
+
+interface ApiKeyStatus {
+  configured: boolean
+  source: 'keychain' | 'environment' | null
+  lastFour: string | null
+}
+
+const API_KEY_NOT_CONFIGURED = 'API_KEY_NOT_CONFIGURED'
 
 // ── 导航项 ──
 type Page = 'timeline' | 'activity' | 'reports' | 'settings'
@@ -90,6 +98,8 @@ function App() {
   const [activeApp, setActiveApp] = useState<ActiveAppInfo | null>(null)
   const [timelineDate, setTimelineDate] = useState(todayStr())
   const [reportTrigger, setReportTrigger] = useState(0)
+  const [missingApiKeyPromptOpen, setMissingApiKeyPromptOpen] = useState(false)
+  const [apiKeyFocusRequest, setApiKeyFocusRequest] = useState(0)
 
   const loadEvents = useCallback(async () => {
     setLoading(true)
@@ -143,6 +153,12 @@ function App() {
     }
   }
 
+  const goToApiKeySettings = () => {
+    setMissingApiKeyPromptOpen(false)
+    setApiKeyFocusRequest((request) => request + 1)
+    setPage('settings')
+  }
+
   const generateReport = async (date?: string) => {
     setGenerating(true)
     setError(null)
@@ -151,7 +167,11 @@ function App() {
       setReportTrigger((t) => t + 1)
       setPage('reports')
     } catch (e) {
-      setError(String(e))
+      if (String(e) === API_KEY_NOT_CONFIGURED) {
+        setMissingApiKeyPromptOpen(true)
+      } else {
+        setError(String(e))
+      }
     } finally {
       setGenerating(false)
     }
@@ -205,8 +225,38 @@ function App() {
         )}
         {page === 'activity' && <ActivityAnalysisPage />}
         {page === 'reports' && <ReportsPage refreshTrigger={reportTrigger} />}
-        {page === 'settings' && <SettingsPage />}
+        {page === 'settings' && (
+          <SettingsPage focusApiKeyRequest={apiKeyFocusRequest} />
+        )}
       </main>
+
+      {missingApiKeyPromptOpen && (
+        <div className="dialog-backdrop" role="presentation">
+          <div
+            className="dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="api-key-dialog-title"
+            aria-describedby="api-key-dialog-description"
+          >
+            <h2 id="api-key-dialog-title">需要配置 API Key</h2>
+            <p id="api-key-dialog-description">
+              生成日报前，请先配置 DeepSeek API Key。
+            </p>
+            <div className="dialog-actions">
+              <button
+                className="secondary-btn"
+                onClick={() => setMissingApiKeyPromptOpen(false)}
+              >
+                取消
+              </button>
+              <button className="add-btn" onClick={goToApiKeySettings} autoFocus>
+                去设置
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -438,12 +488,21 @@ function ReportCard({
 }
 
 // ── 设置页 ──
-function SettingsPage() {
+function SettingsPage({ focusApiKeyRequest }: { focusApiKeyRequest: number }) {
   const [blacklist, setBlacklist] = useState<BlacklistRow[]>([])
   const [newBundleId, setNewBundleId] = useState('')
   const [newAppName, setNewAppName] = useState('')
   const [accessGranted, setAccessGranted] = useState(false)
   const [clearing, setClearing] = useState(false)
+  const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus | null>(null)
+  const [apiKey, setApiKey] = useState('')
+  const [showApiKey, setShowApiKey] = useState(false)
+  const [savingApiKey, setSavingApiKey] = useState(false)
+  const [apiKeyFeedback, setApiKeyFeedback] = useState<{
+    type: 'success' | 'error'
+    message: string
+  } | null>(null)
+  const apiKeyInputRef = useRef<HTMLInputElement>(null)
 
   const loadBlacklist = useCallback(async () => {
     try {
@@ -461,10 +520,63 @@ function SettingsPage() {
     }
   }, [])
 
+  const loadApiKeyStatus = useCallback(async () => {
+    try {
+      setApiKeyStatus(await invoke<ApiKeyStatus>('get_api_key_status'))
+    } catch (e) {
+      setApiKeyFeedback({ type: 'error', message: String(e) })
+    }
+  }, [])
+
   useEffect(() => {
     loadBlacklist()
     loadAccessStatus()
-  }, [loadBlacklist, loadAccessStatus])
+    loadApiKeyStatus()
+  }, [loadBlacklist, loadAccessStatus, loadApiKeyStatus])
+
+  useEffect(() => {
+    if (focusApiKeyRequest > 0) {
+      apiKeyInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      apiKeyInputRef.current?.focus()
+    }
+  }, [focusApiKeyRequest])
+
+  const handleSaveApiKey = async () => {
+    if (!apiKey.trim()) {
+      setApiKeyFeedback({ type: 'error', message: '请输入 API Key' })
+      apiKeyInputRef.current?.focus()
+      return
+    }
+
+    setSavingApiKey(true)
+    setApiKeyFeedback(null)
+    try {
+      const status = await invoke<ApiKeyStatus>('save_and_verify_api_key', {
+        apiKey: apiKey.trim(),
+      })
+      setApiKeyStatus(status)
+      setApiKey('')
+      setShowApiKey(false)
+      setApiKeyFeedback({ type: 'success', message: 'API Key 已保存并验证' })
+    } catch (e) {
+      setApiKeyFeedback({ type: 'error', message: String(e) })
+    } finally {
+      setSavingApiKey(false)
+    }
+  }
+
+  const handleDeleteApiKey = async () => {
+    if (!confirm('确定要移除已保存的 DeepSeek API Key 吗？')) return
+    setApiKeyFeedback(null)
+    try {
+      const status = await invoke<ApiKeyStatus>('delete_api_key')
+      setApiKeyStatus(status)
+      setApiKey('')
+      setApiKeyFeedback({ type: 'success', message: '已移除钥匙串中的 API Key' })
+    } catch (e) {
+      setApiKeyFeedback({ type: 'error', message: String(e) })
+    }
+  }
 
   const handleAdd = async () => {
     if (!newBundleId.trim()) return
@@ -513,6 +625,70 @@ function SettingsPage() {
 
   return (
     <>
+      <div className="settings-section" id="api-key-settings">
+        <h2>DeepSeek API Key</h2>
+        <div className="api-key-card">
+          <div className="api-key-heading-row">
+            <div className="permission-info">
+              <p>日报生成服务</p>
+              <p className="hint">
+                密钥保存在 macOS 钥匙串中，日报时间线将发送给 DeepSeek 处理
+              </p>
+            </div>
+            <span
+              className={`permission-status ${apiKeyStatus?.configured ? 'granted' : 'denied'}`}
+            >
+              {apiKeyStatus?.configured
+                ? `已配置 ····${apiKeyStatus.lastFour ?? ''}`
+                : '未配置'}
+            </span>
+          </div>
+          {apiKeyStatus?.source === 'environment' && (
+            <p className="api-key-source">当前由 DEEPSEEK_API_KEY 环境变量提供</p>
+          )}
+          <div className="api-key-form-row">
+            <input
+              ref={apiKeyInputRef}
+              type={showApiKey ? 'text' : 'password'}
+              value={apiKey}
+              onChange={(event) => setApiKey(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !savingApiKey) handleSaveApiKey()
+              }}
+              placeholder={apiKeyStatus?.configured ? '输入新 Key 以替换' : '输入 API Key'}
+              autoComplete="off"
+              spellCheck={false}
+              aria-label="DeepSeek API Key"
+            />
+            <label className="show-key-control">
+              <input
+                type="checkbox"
+                checked={showApiKey}
+                onChange={(event) => setShowApiKey(event.target.checked)}
+              />
+              显示
+            </label>
+            <button className="add-btn" onClick={handleSaveApiKey} disabled={savingApiKey}>
+              {savingApiKey ? '验证中…' : '保存并验证'}
+            </button>
+          </div>
+          <div className="api-key-footer">
+            <div aria-live="polite">
+              {apiKeyFeedback && (
+                <p className={`api-key-feedback ${apiKeyFeedback.type}`}>
+                  {apiKeyFeedback.message}
+                </p>
+              )}
+            </div>
+            {apiKeyStatus?.source === 'keychain' && (
+              <button className="delete-btn" onClick={handleDeleteApiKey}>
+                移除密钥
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
       {/* Accessibility 权限引导 */}
       <div className="settings-section">
         <h2>辅助功能权限</h2>
