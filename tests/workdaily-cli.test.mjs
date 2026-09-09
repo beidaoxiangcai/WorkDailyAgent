@@ -81,10 +81,11 @@ function fixture() {
   return { directory, dbPath }
 }
 
-function runCli(args, environment) {
+function runCli(args, environment, input) {
   return execFileSync(process.execPath, [cliPath, ...args], {
     encoding: 'utf8',
     env: { ...process.env, ...environment },
+    input,
   })
 }
 
@@ -113,6 +114,35 @@ test('context normalizes idle overlap and keeps short events out of activity blo
     const idle = context.events.find((event) => event.app === '(空闲)')
     assert.equal(idle.start_ts, Date.parse('2026-09-07T10:00:00+08:00') / 1000)
     assert.equal(idle.duration_ms, 30 * 60 * 1000)
+  } finally {
+    rmSync(directory, { recursive: true })
+  }
+})
+
+test('day report context returns compact raw events without timeline derivatives', () => {
+  const { directory, dbPath } = fixture()
+  try {
+    const context = JSON.parse(runCli(
+      ['report', 'context', '--date', '2026-09-07', '--db', dbPath],
+      { WORKDAILY_APP_DATA_DIR: directory },
+    ))
+    assert.equal(context.kind, 'day')
+    assert.equal(context.input_mode, 'raw_events')
+    assert.equal(context.events.length, 3)
+    assert.equal('activity_blocks' in context, false)
+    assert.equal('usage' in context, false)
+    assert.deepEqual(context.event_fields, [
+      'start_ts', 'end_ts', 'app', 'window_title', 'duration_ms', 'ongoing',
+    ])
+    assert.equal(context.event_fields.includes('id'), false)
+    assert.equal(context.event_fields.includes('bundle_id'), false)
+    assert.ok(context.events.every(Array.isArray))
+    assert.ok(context.events.every((event) => event.length === context.event_fields.length))
+
+    const database = new DatabaseSync(dbPath, { readOnly: true })
+    const reportCount = database.prepare('SELECT COUNT(*) AS count FROM reports').get()
+    database.close()
+    assert.equal(Number(reportCount.count), 0)
   } finally {
     rmSync(directory, { recursive: true })
   }
@@ -217,6 +247,7 @@ test('report save writes the existing reports table and an export file', () => {
     )
     const result = JSON.parse(output)
     assert.equal(result.id, 1)
+    assert.equal(result.exported, true)
     assert.ok(existsSync(result.path))
 
     const database = new DatabaseSync(dbPath, { readOnly: true })
@@ -225,6 +256,32 @@ test('report save writes the existing reports table and an export file', () => {
     assert.equal(row.llm_model, 'agent')
     assert.ok(row.content.includes('CLI 数据查询验证'))
     assert.equal(existsSync(join(directory, 'exports', '2026-09-07', 'behavior-timeline.html')), false)
+  } finally {
+    rmSync(directory, { recursive: true })
+  }
+})
+
+test('report save accepts stdin and can persist without exporting a file', () => {
+  const { directory, dbPath } = fixture()
+  try {
+    const content = '【今日完成】\n- 完成 CLI 无文件保存验证。\n'
+    const result = JSON.parse(runCli(
+      [
+        'report', 'save', '--date', '2026-09-07', '--stdin', '--no-export',
+        '--db', dbPath,
+      ],
+      { WORKDAILY_APP_DATA_DIR: directory },
+      content,
+    ))
+    assert.equal(result.id, 1)
+    assert.equal(result.exported, false)
+    assert.equal('path' in result, false)
+    assert.equal(existsSync(join(directory, 'exports')), false)
+
+    const database = new DatabaseSync(dbPath, { readOnly: true })
+    const row = database.prepare('SELECT content FROM reports WHERE id = 1').get()
+    database.close()
+    assert.equal(row.content, content.trim())
   } finally {
     rmSync(directory, { recursive: true })
   }
@@ -248,6 +305,67 @@ test('range context includes both endpoints and preserves empty days', () => {
     assert.equal(context.days[0].totals.event_count, 0)
     assert.ok(context.days.find((day) => day.date === '2026-09-07').totals.event_count > 0)
     assert.equal('events' in context.days.find((day) => day.date === '2026-09-07'), false)
+  } finally {
+    rmSync(directory, { recursive: true })
+  }
+})
+
+test('range report context aggregates app titles across seven-day database chunks', () => {
+  const { directory, dbPath } = fixture()
+  try {
+    const firstChunkStart = Date.parse('2026-08-31T09:00:00+08:00') / 1000
+    const secondChunkStart = Date.parse('2026-09-08T09:00:00+08:00') / 1000
+    insertEvent(
+      dbPath,
+      firstChunkStart,
+      firstChunkStart + 600,
+      'Xcode',
+      'com.apple.dt.Xcode',
+      'WorkDailyAgent — AppDelegate.m',
+    )
+    insertEvent(
+      dbPath,
+      secondChunkStart,
+      secondChunkStart + 600,
+      'Xcode',
+      'com.apple.dt.Xcode',
+      'WorkDailyAgent — AppDelegate.m',
+    )
+
+    const context = JSON.parse(runCli(
+      [
+        'report', 'context', '--from', '2026-08-30', '--to', '2026-09-08',
+        '--db', dbPath,
+      ],
+      { WORKDAILY_APP_DATA_DIR: directory },
+    ))
+    assert.equal(context.kind, 'range')
+    assert.equal(context.input_mode, 'app_title_aggregates')
+    assert.equal(context.chunk_days, 7)
+    assert.equal(context.chunk_count, 2)
+    assert.equal(context.days.length, 10)
+    assert.equal('events' in context, false)
+    assert.equal('activity_blocks' in context, false)
+    assert.equal('usage' in context, false)
+
+    assert.deepEqual(context.aggregate_fields, [
+      'app', 'window_title', 'duration_ms', 'event_count', 'active_days', 'first_ts', 'last_ts',
+    ])
+    const aggregateIndex = Object.fromEntries(
+      context.aggregate_fields.map((field, index) => [field, index]),
+    )
+    const xcode = context.aggregates.find(
+      (item) => item[aggregateIndex.app] === 'Xcode' &&
+        item[aggregateIndex.window_title] === 'WorkDailyAgent — AppDelegate.m',
+    )
+    assert.equal(xcode[aggregateIndex.event_count], 3)
+    assert.equal(xcode[aggregateIndex.active_days], 3)
+    assert.equal(xcode[aggregateIndex.duration_ms], 4_800_000)
+
+    const database = new DatabaseSync(dbPath, { readOnly: true })
+    const reportCount = database.prepare('SELECT COUNT(*) AS count FROM reports').get()
+    database.close()
+    assert.equal(Number(reportCount.count), 0)
   } finally {
     rmSync(directory, { recursive: true })
   }
@@ -355,6 +473,17 @@ test('skill keeps a complete timeline range in one CLI invocation', () => {
   assert.match(skill, /7 天仅是 CLI 内部的 SQLite 查询分批大小/)
   assert.match(skill, /不得因范围超过 7 天而拆成多次 `timeline show`/)
   assert.doesNotMatch(skill, /多日轨迹每次最多查询 7 个自然日/)
+})
+
+test('skill saves day reports without files and does not save range summaries', () => {
+  const skill = readFileSync(skillPath, 'utf8')
+  assert.match(skill, /单日日报.*`report context --date/)
+  assert.match(skill, /多日总结.*`report context --from/)
+  assert.match(skill, /`report save --date <date> --stdin --no-export`/)
+  assert.match(skill, /单日日报默认写入应用现有 `reports` 表但不导出文件/)
+  assert.match(skill, /多日总结默认不保存/)
+  assert.match(skill, /只有用户明确要求导出时才创建 Markdown/)
+  assert.doesNotMatch(skill, /生成日报：运行 `context --date/)
 })
 
 test('seven-day timeline expands by default and supports explicit collapse override', () => {

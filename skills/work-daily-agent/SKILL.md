@@ -16,7 +16,9 @@ node "$SKILL_DIR/scripts/workdaily-agent.mjs" <command>
 - 用户要求安装、检查或启动应用：运行 `doctor`，按需运行 `setup` 或 `start`。仅在用户要求时下载依赖或启动桌面应用。
 - 用户要求查看原始记录：单日运行 `events --date <date>`；多日运行 `events --from <date> --to <date>`，完整记录按日写入本地目录。除非用户明确要求，不展开全部窗口标题。
 - 用户要求查看行为轨迹：单日运行 `timeline show --date <date> --no-open --json`；多日将用户的完整日期范围传给一次 `timeline show --from <date> --to <date> --no-open --json`。只打开并返回该命令生成的唯一 `index.html` 入口，不生成日报。
-- 用户要求生成日报：运行 `context --date <date>`，由当前 Agent 基于数据生成中文日报，再运行 `report save --date <date> --file <markdown>` 保存。此操作默认保存，但不生成行为轨迹。
+- 用户要求生成单日日报：运行 `report context --date <date>`，由当前 Agent 基于返回的精简原始事件生成中文日报；将日报正文通过标准输入传给 `report save --date <date> --stdin --no-export`，保存到应用后直接在对话中回答。默认不创建 Markdown 文件，也不生成行为轨迹。
+- 用户要求生成多日总结：将完整日期范围传给一次 `report context --from <date> --to <date>`，由当前 Agent 基于返回的应用标题聚合结果生成中文总结并直接在对话中回答。默认不创建文件、不调用 `report save`。
+- 用户明确要求导出 Markdown 时，才改用 `report save --date <date> --file <markdown>` 或省略 `--no-export`；`report save` 不用于保存多日总结。
 - 用户同时要求日报和轨迹时，分别执行上述两个流程。
 - 用户要求查询历史日报：运行 `report list` 或 `report show <id>`。
 
@@ -24,12 +26,14 @@ node "$SKILL_DIR/scripts/workdaily-agent.mjs" <command>
 
 ## 日报规则
 
-1. 只使用 `context` 返回的应用名、窗口标题、时间和时长作为事实依据。
+1. 只使用 `report context` 返回的应用名、窗口标题、时间和时长作为事实依据。
 2. 可以合并同一项目的连续活动并概括动作，但不得把窗口标题推断成已完成成果。
 3. 信息不足时使用“处理”“查看”“沟通”等中性表达，或明确说明记录不足。
 4. 默认输出 2 至 5 条“今日完成”，按项目或时间组织，语言简洁。
-5. 生成成功后默认保存到应用现有 `reports` 表，并保留一份 Markdown 导出文件。保存失败时仍返回已生成内容，并明确说明未保存。
+5. 单日日报默认写入应用现有 `reports` 表但不导出文件；多日总结默认不保存。两者都直接在对话中回答，只有用户明确要求导出时才创建 Markdown。单日日报保存失败时仍返回已生成内容并明确说明未保存。
 6. 不读取或输出 DeepSeek API Key；Agent 生成日报不依赖应用内 DeepSeek 配置。
+
+单日 `report context` 只返回生成日报所需的原始事件字段，不返回行为轨迹块或应用明细副本。为减少 Token，事件和聚合项使用紧凑数据行，字段顺序分别由同一结果中的 `event_fields`、`day_fields` 和 `aggregate_fields` 定义。多日 `report context` 在单次命令内按 7 个自然日分批查询，逐批按应用标识和窗口标题聚合，再跨批次合并为唯一模型输入；7 天不是 Agent 调用或用户范围上限。不得为了生成多日总结而拆成多次 CLI 调用。
 
 需要理解查询字段、运行中事件或降级行为时，读取 [references/data-contract.md](references/data-contract.md)。
 

@@ -20,7 +20,7 @@
 | 数据查询 | 前端通过 Tauri `query_events` 查询 | `events/context` 以 JSON 向 Agent 提供同口径数据 |
 | 进行中事件 | `AppState.runtime_events` 供应用内查询 | Unix Socket 复用 `query_day_events` 查询 |
 | 活动分析 | React 页面内时间轴与占比 | CLI 默认 HTML 模板、离线快照和样式管理 |
-| 日报 | 应用内 DeepSeek 生成并保存 | Agent 用 `context` 生成，`report save` 写入现有表 |
+| 日报 | 应用内 DeepSeek 生成并保存 | Agent 用 `report context` 生成；单日通过标准输入保存且不导出文件，多日只回答 |
 | Skill | 无 | `skills/work-daily-agent` 中文指令、模板和参考文档 |
 
 ## 3. CLI 命令
@@ -34,9 +34,9 @@
 | `context` | 返回单日完整 JSON，或多日摘要/完整导出 |
 | `timeline show` | 生成单日 HTML 或按需加载的多日轨迹目录 |
 | `style list/save/set-default/delete` | 管理可复用本机 HTML 模板 |
-| `report list/show/save` | 查询日报，或将 Agent 生成的日报保存到应用 |
+| `report context/list/show/save` | 准备日报模型输入、查询日报，或从标准输入/文件保存 Agent 生成的单日日报 |
 
-`events`、`context` 和 `timeline show` 同时支持单日 `--date` 与多日 `--from/--to`。两组参数互斥，范围查询的首尾日期都包含在结果中。Agent 将用户完整范围传给一次 CLI 命令，不按数据库分批大小拆分调用。
+`events`、`context`、`report context` 和 `timeline show` 同时支持单日 `--date` 与多日 `--from/--to`。两组参数互斥，范围查询的首尾日期都包含在结果中。Agent 将用户完整范围传给一次 CLI 命令，不按数据库分批大小拆分调用。
 
 ## 4. 本机应用桥接
 
@@ -75,6 +75,19 @@ exports/<from>-to-<to>/behavior-timeline/
 
 多日默认模板使用 `{{WORKDAILY_RANGE_JSON}}`，共享渲染器只通过 DOM API 写入应用名和窗口标题。每日 JS 对 `<`、Unicode 行分隔符和段落分隔符进行转义，输出文件权限为 `0600`。
 
+### 6.2 日报上下文管线
+
+`report context` 不复用包含轨迹和占比派生数据的通用 `context` 输出：
+
+- 单日按时间正序返回精简原始事件，只保留时间、应用、窗口标题、时长和进行中状态。
+- 日报上下文使用字段表加数据行的紧凑 JSON，避免为每条事件或聚合项重复输出字段名。
+- 多日由一次命令接收完整范围，内部仍以 7 个自然日为一个 SQLite 查询批次。
+- 每个批次只在处理期间保留原始事件，并按应用标识和窗口标题生成局部聚合；批次结束后将局部聚合合并到全范围结果。
+- 最终模型输入只包含每日计数和跨批次聚合，不包含行为轨迹块、应用明细或每日原始事件。
+- `report context` 为只读命令。单日日报默认将正文通过标准输入传给 `report save --stdin --no-export`，只写入日报表而不创建报告文件；多日总结默认只回答、不调用保存命令。原有 `--file` 保存和 Markdown 导出能力继续保留，供用户明确要求导出时使用。
+
+日报上下文管线与 `timeline show` 分离，不改变单日 HTML、多日每日 JS、共享渲染器或按需加载逻辑。
+
 ## 7. 打包与安装
 
 - `package.json` 的 `bin` 将 `workdaily-agent` 指向 Skill 内 CLI 脚本。
@@ -96,8 +109,9 @@ exports/<from>-to-<to>/behavior-timeline/
 
 1. 使用固定 SQLite 数据验证查询、空闲重叠归一化和 30 秒行为块阈值。
 2. 验证恶意窗口标题不会以 HTML 执行。
-3. 验证 Agent 日报可写入现有 `reports` 表并生成 Markdown 导出。
+3. 验证 Agent 单日日报可从标准输入写入现有 `reports` 表且不生成文件，并验证显式文件导出保持兼容。
 4. 运行前端构建、Rust 测试、Skill 结构校验和 npm 打包内容检查。
 5. 将 Skill 安装到独立临时目录，从安装后位置执行 `doctor`。
 6. 使用跨零点固定数据验证 7 天分块、空白日期、范围汇总和每日 JS 转义。
 7. 验证 7 天以内默认展开、8 天及以上默认折叠，以及单日模板回归行为。
+8. 验证单日日报上下文不包含派生展示结构，多日聚合可跨 7 天批次合并且查询不写入日报表。

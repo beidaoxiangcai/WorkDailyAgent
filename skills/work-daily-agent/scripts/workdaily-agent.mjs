@@ -44,6 +44,31 @@ const MANAGED_SOURCE_DIR = join(APP_DATA_DIR, 'source')
 const TEMPLATE_PLACEHOLDER = '{{WORKDAILY_DATA_JSON}}'
 const RANGE_TEMPLATE_PLACEHOLDER = '{{WORKDAILY_RANGE_JSON}}'
 const RANGE_CHUNK_DAYS = 7
+const REPORT_EVENT_FIELDS = [
+  'start_ts',
+  'end_ts',
+  'app',
+  'window_title',
+  'duration_ms',
+  'ongoing',
+]
+const REPORT_DAY_FIELDS = [
+  'date',
+  'live',
+  'source',
+  'warning',
+  'event_count',
+  'recorded_duration_ms',
+]
+const REPORT_AGGREGATE_FIELDS = [
+  'app',
+  'window_title',
+  'duration_ms',
+  'event_count',
+  'active_days',
+  'first_ts',
+  'last_ts',
+]
 
 const BOOLEAN_OPTIONS = new Set([
   'json',
@@ -51,6 +76,8 @@ const BOOLEAN_OPTIONS = new Set([
   'set-default',
   'expand-all',
   'collapse-all',
+  'stdin',
+  'no-export',
   'yes',
   'help',
 ])
@@ -87,6 +114,10 @@ function fail(message, exitCode = 1) {
 
 function printJson(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`)
+}
+
+function printCompactJson(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`)
 }
 
 function formatToday() {
@@ -628,6 +659,196 @@ function aggregateUsage(events) {
     .toSorted((left, right) => right.duration_ms - left.duration_ms || left.app.localeCompare(right.app))
 }
 
+function reportEvent(event) {
+  return [
+    event.start_ts,
+    event.end_ts,
+    event.app,
+    event.window_title?.trim() || null,
+    Math.max(0, event.duration_ms || (event.end_ts - event.start_ts) * 1000),
+    Boolean(event.ongoing),
+  ]
+}
+
+function buildDayReportContext(result) {
+  const sourceEvents = result.events
+    .filter((event) => event.end_ts > event.start_ts)
+    .toSorted((left, right) => left.start_ts - right.start_ts || left.end_ts - right.end_ts)
+  const events = sourceEvents.map(reportEvent)
+  return {
+    schema_version: 1,
+    kind: 'day',
+    input_mode: 'raw_events',
+    date: result.date,
+    timezone: 'Asia/Shanghai',
+    live: result.live,
+    source: result.source,
+    warning: result.warning ?? null,
+    generated_at: Math.floor(Date.now() / 1000),
+    event_fields: REPORT_EVENT_FIELDS,
+    totals: {
+      event_count: events.length,
+      recorded_duration_ms: events.reduce((total, event) => total + event[4], 0),
+      application_count: new Set(sourceEvents.map(appKey)).size,
+    },
+    events,
+  }
+}
+
+function addReportAggregate(groups, event, date) {
+  if (event.end_ts <= event.start_ts) return
+  const durationMs = Math.max(0, event.duration_ms || (event.end_ts - event.start_ts) * 1000)
+  if (durationMs === 0) return
+  const title = event.window_title?.trim() || null
+  const key = JSON.stringify([appKey(event), title])
+  const current = groups.get(key) ?? {
+    _key: key,
+    _dates: new Set(),
+    app: displayAppName(event),
+    window_title: title,
+    duration_ms: 0,
+    event_count: 0,
+    first_ts: event.start_ts,
+    last_ts: event.end_ts,
+  }
+  current.duration_ms += durationMs
+  current.event_count += 1
+  current.first_ts = Math.min(current.first_ts, event.start_ts)
+  current.last_ts = Math.max(current.last_ts, event.end_ts)
+  current._dates.add(date)
+  groups.set(key, current)
+}
+
+function mergeReportAggregates(target, source) {
+  for (const item of source.values()) {
+    const current = target.get(item._key)
+    if (!current) {
+      target.set(item._key, item)
+      continue
+    }
+    current.duration_ms += item.duration_ms
+    current.event_count += item.event_count
+    current.first_ts = Math.min(current.first_ts, item.first_ts)
+    current.last_ts = Math.max(current.last_ts, item.last_ts)
+    for (const date of item._dates) current._dates.add(date)
+  }
+}
+
+async function buildRangeReportContext(options, selection) {
+  const dbPath = options.db ? resolve(options.db) : DEFAULT_DB_PATH
+  const today = formatToday()
+  const groups = new Map()
+  const applicationKeys = new Set()
+  const sources = new Set()
+  const warnings = []
+  const days = []
+  let live = false
+  let eventCount = 0
+  let recordedDurationMs = 0
+  let activeDayCount = 0
+  let liveToday = null
+
+  if (!options.db && selection.from <= today && today <= selection.to) {
+    const response = await requestRunningApp({ action: 'query_events', date: today })
+    if (response?.events) {
+      liveToday = { date: today, live: true, source: 'application', events: response.events }
+    }
+  }
+
+  for (const chunk of chunkDateRange(selection.from, selection.to)) {
+    const [chunkStart] = shanghaiDayRange(chunk.from)
+    const [, chunkEnd] = shanghaiDayRange(chunk.to)
+    const splitEvents = splitEventsByDate(
+      queryDatabaseEventsBetween(dbPath, chunkStart, chunkEnd),
+      chunk.from,
+      chunk.to,
+    )
+    const chunkGroups = new Map()
+
+    for (const date of datesInRange(chunk.from, chunk.to)) {
+      const result = date === today && liveToday
+        ? liveToday
+        : {
+            date,
+            live: false,
+            source: 'sqlite',
+            warning: date === today
+              ? '应用未运行或本机查询通道不可用，当前尚未结束的活动可能未包含。'
+              : null,
+            events: splitEvents.get(date) ?? [],
+          }
+      const events = result.events.filter((event) => event.end_ts > event.start_ts)
+      const dayDurationMs = events.reduce(
+        (total, event) => total + Math.max(0, event.duration_ms || (event.end_ts - event.start_ts) * 1000),
+        0,
+      )
+      live ||= result.live
+      sources.add(result.source)
+      if (result.warning && !warnings.includes(result.warning)) warnings.push(result.warning)
+      eventCount += events.length
+      recordedDurationMs += dayDurationMs
+      if (events.length > 0) activeDayCount += 1
+      for (const event of events) {
+        applicationKeys.add(appKey(event))
+        addReportAggregate(chunkGroups, event, date)
+      }
+      days.push([
+        date,
+        result.live,
+        result.source,
+        result.warning ?? null,
+        events.length,
+        dayDurationMs,
+      ])
+    }
+
+    mergeReportAggregates(groups, chunkGroups)
+  }
+
+  const aggregates = [...groups.values()]
+    .map(({ _dates, app, window_title, duration_ms, event_count, first_ts, last_ts }) => [
+      app,
+      window_title,
+      duration_ms,
+      event_count,
+      _dates.size,
+      first_ts,
+      last_ts,
+    ])
+    .toSorted((left, right) =>
+      right[2] - left[2] ||
+      left[0].localeCompare(right[0]) ||
+      String(left[1]).localeCompare(String(right[1])),
+    )
+
+  return {
+    schema_version: 1,
+    kind: 'range',
+    input_mode: 'app_title_aggregates',
+    from: selection.from,
+    to: selection.to,
+    timezone: 'Asia/Shanghai',
+    chunk_days: RANGE_CHUNK_DAYS,
+    chunk_count: chunkDateRange(selection.from, selection.to).length,
+    generated_at: Math.floor(Date.now() / 1000),
+    live,
+    source: sources.size > 1 ? 'mixed' : [...sources][0] ?? 'sqlite',
+    warnings,
+    day_fields: REPORT_DAY_FIELDS,
+    aggregate_fields: REPORT_AGGREGATE_FIELDS,
+    totals: {
+      day_count: selection.day_count,
+      active_day_count: activeDayCount,
+      event_count: eventCount,
+      recorded_duration_ms: recordedDurationMs,
+      application_count: applicationKeys.size,
+      aggregate_count: aggregates.length,
+    },
+    days,
+    aggregates,
+  }
+}
+
 function buildContext(result) {
   const chronologicalEvents = result.events.toSorted(
     (left, right) => left.start_ts - right.start_ts || left.end_ts - right.end_ts,
@@ -1068,9 +1289,13 @@ async function listReports(options) {
 
 async function saveReport(options) {
   const date = normalizeDate(options.date)
-  if (!options.file) fail('report save 需要 --file <Markdown文件>')
-  const sourcePath = resolve(options.file)
-  const content = readFileSync(sourcePath, 'utf8').trim()
+  if (options.stdin && options.file) fail('--stdin 与 --file 不能同时使用')
+  if (!options.stdin && !options.file) {
+    fail('report save 需要 --stdin 或 --file <Markdown文件>')
+  }
+  const content = options.stdin
+    ? readFileSync(0, 'utf8').trim()
+    : readFileSync(resolve(options.file), 'utf8').trim()
   if (!content) fail('日报内容不能为空')
   if (content.length > 1_000_000) fail('日报内容不能超过 1 MB')
   const context = buildContext(await queryEvents(options))
@@ -1110,13 +1335,23 @@ async function saveReport(options) {
     }
   }
 
+  if (options['no-export']) return printJson({ ok: true, id, date, exported: false })
   const exportPath = outputPath(options, date, `daily-report-${id}.md`)
   writePrivateFile(exportPath, `${content}\n`)
-  printJson({ ok: true, id, date, path: exportPath })
+  printJson({ ok: true, id, date, exported: true, path: exportPath })
+}
+
+async function reportContext(options) {
+  const selection = resolveDateSelection(options)
+  if (selection.kind === 'range') {
+    return printCompactJson(await buildRangeReportContext(options, selection))
+  }
+  return printCompactJson(buildDayReportContext(await queryEvents(options)))
 }
 
 async function commandReport(positionals, options) {
   const action = positionals[0] ?? 'list'
+  if (action === 'context') return reportContext(options)
   if (action === 'list') return printJson(await listReports(options))
   if (action === 'show') {
     const id = Number(positionals[1] ?? options.id)
@@ -1140,9 +1375,10 @@ function printHelp() {
   workdaily-agent events [--date today | --from YYYY-MM-DD --to YYYY-MM-DD] [--db PATH] [--output DIR]
   workdaily-agent context [--date today | --from YYYY-MM-DD --to YYYY-MM-DD] [--detail summary|full] [--db PATH] [--output DIR]
   workdaily-agent timeline show [--date today | --from YYYY-MM-DD --to YYYY-MM-DD] [--style NAME | --template PATH] [--output PATH|DIR] [--expand-all | --collapse-all] [--no-open]
+  workdaily-agent report context [--date today | --from YYYY-MM-DD --to YYYY-MM-DD] [--db PATH]
   workdaily-agent report list [--date YYYY-MM-DD]
   workdaily-agent report show ID
-  workdaily-agent report save --date YYYY-MM-DD --file REPORT.md [--generator agent]
+  workdaily-agent report save --date YYYY-MM-DD (--stdin | --file REPORT.md) [--no-export] [--generator agent]
   workdaily-agent style list
   workdaily-agent style save --name NAME --template TEMPLATE.html [--scope day|range] [--set-default]
   workdaily-agent style set-default NAME [--scope day|range]
