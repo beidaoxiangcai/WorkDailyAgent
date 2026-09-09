@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WorkDailyAgent 行为轨迹</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #ffffff;
+      --bg-soft: #f5f6f8;
+      --border: #e1e4e8;
+      --text: #58606e;
+      --text-h: #20242b;
+      --text-muted: #9198a4;
+      --accent: #3478df;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-synthesis: none;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--bg-soft);
+      letter-spacing: 0;
+    }
+
+    button {
+      color: inherit;
+      font: inherit;
+    }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 48px;
+    }
+
+    .page-header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 18px;
+    }
+
+    h1,
+    h2,
+    p {
+      margin: 0;
+    }
+
+    h1 {
+      color: var(--text-h);
+      font-size: 24px;
+      line-height: 1.25;
+    }
+
+    .date {
+      margin-top: 5px;
+      color: var(--text-muted);
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    .live {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: #147d79;
+      font-size: 12px;
+    }
+
+    .live::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #22a9a5;
+      content: "";
+    }
+
+    .live.offline {
+      color: var(--text-muted);
+    }
+
+    .live.offline::before {
+      background: #a6a6aa;
+    }
+
+    .warning {
+      display: none;
+      margin-bottom: 14px;
+      padding: 10px 12px;
+      border: 1px solid #e8cf9d;
+      border-radius: 6px;
+      color: #765217;
+      background: #fff8e8;
+      font-size: 13px;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      min-width: 0;
+      padding: 15px 18px;
+      border-right: 1px solid var(--border);
+    }
+
+    .metric:last-child {
+      border-right: 0;
+    }
+
+    .metric-label {
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+
+    .metric-value {
+      display: block;
+      margin-top: 4px;
+      overflow: hidden;
+      color: var(--text-h);
+      font-family: var(--mono);
+      font-size: 20px;
+      font-weight: 650;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .section {
+      margin-bottom: 14px;
+      padding: 16px 20px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+    }
+
+    .section h2 {
+      margin-bottom: 18px;
+      color: var(--text-h);
+      font-size: 16px;
+    }
+
+    .range + .range {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .range-title {
+      margin-bottom: 2px;
+      color: var(--text-h);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .axis {
+      position: relative;
+      height: 42px;
+      margin: 0 8px;
+      border-bottom: 1px solid var(--text-muted);
+    }
+
+    .axis::after {
+      position: absolute;
+      inset: auto 0 0;
+      height: 6px;
+      opacity: 0.55;
+      background: repeating-linear-gradient(
+        90deg,
+        var(--text-muted) 0,
+        var(--text-muted) 1px,
+        transparent 1px,
+        transparent calc(100% / 72)
+      );
+      content: "";
+    }
+
+    .axis-tick {
+      position: absolute;
+      bottom: -1px;
+      width: 1px;
+      height: 10px;
+      background: var(--text-muted);
+    }
+
+    .axis-tick span {
+      position: absolute;
+      bottom: 16px;
+      left: 50%;
+      color: var(--text);
+      font-size: 12px;
+      white-space: nowrap;
+      transform: translateX(-50%);
+    }
+
+    .axis-tick:first-child span {
+      left: 0;
+      transform: none;
+    }
+
+    .axis-tick:last-child span {
+      right: 0;
+      left: auto;
+      transform: none;
+    }
+
+    .track {
+      position: relative;
+      height: 68px;
+      margin: 10px 8px 0;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: var(--bg);
+      background-image: linear-gradient(
+        90deg,
+        transparent calc(100% - 1px),
+        color-mix(in srgb, var(--border) 60%, transparent) calc(100% - 1px)
+      );
+      background-size: calc(100% / 6) 100%;
+    }
+
+    .event {
+      position: absolute;
+      top: 4px;
+      bottom: 4px;
+      min-width: 1px;
+      overflow: hidden;
+      border: 1px solid;
+      border-radius: 4px;
+      container-type: inline-size;
+    }
+
+    .event:hover {
+      z-index: 2;
+      filter: brightness(0.97);
+    }
+
+    .event.single {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .event-app {
+      height: 24px;
+      padding: 4px 7px 3px;
+      overflow: hidden;
+      font-size: 11px;
+      text-align: center;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .event.single .event-app {
+      width: 100%;
+      height: auto;
+      padding: 4px;
+    }
+
+    .title-track {
+      position: absolute;
+      inset: 24px 0 0;
+      border-top: 1px solid rgb(255 255 255 / 60%);
+    }
+
+    .title-segment {
+      position: absolute;
+      inset-block: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 1px;
+      padding: 0 5px;
+      overflow: hidden;
+      border-right: 1px solid rgb(255 255 255 / 55%);
+      font-size: 10px;
+    }
+
+    .title-segment span {
+      width: 100%;
+      overflow: hidden;
+      text-align: center;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    @container (max-width: 42px) {
+      .event-app,
+      .title-segment span {
+        visibility: hidden;
+      }
+
+      .title-track {
+        inset-block: 0;
+        border-top: 0;
+      }
+    }
+
+    .usage-content {
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      align-items: center;
+      gap: 32px;
+    }
+
+    .donut {
+      position: relative;
+      width: 190px;
+      height: 190px;
+      margin: 10px auto;
+      border-radius: 50%;
+      background: var(--bg-soft);
+    }
+
+    .donut::after {
+      position: absolute;
+      inset: 44px;
+      border-radius: 50%;
+      background: var(--bg);
+      content: "";
+    }
+
+    .usage-list {
+      min-width: 0;
+    }
+
+    details {
+      border-bottom: 1px solid var(--border);
+    }
+
+    details:last-child {
+      border-bottom: 0;
+    }
+
+    summary {
+      display: grid;
+      grid-template-columns: 14px 10px minmax(100px, 1fr) 96px 72px;
+      align-items: center;
+      gap: 10px;
+      min-height: 42px;
+      cursor: pointer;
+      list-style: none;
+    }
+
+    summary::-webkit-details-marker {
+      display: none;
+    }
+
+    summary:hover {
+      background: var(--bg-soft);
+    }
+
+    .chevron {
+      width: 7px;
+      height: 7px;
+      margin-left: 2px;
+      border-right: 1.5px solid var(--text-muted);
+      border-bottom: 1.5px solid var(--text-muted);
+      transform: rotate(-45deg);
+    }
+
+    details[open] .chevron {
+      transform: rotate(45deg);
+    }
+
+    .swatch {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+    }
+
+    .app-name {
+      overflow: hidden;
+      color: var(--text-h);
+      font-weight: 500;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .number {
+      font-family: var(--mono);
+      font-size: 12px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .detail-list {
+      padding: 2px 0 6px 44px;
+      background: color-mix(in srgb, var(--bg-soft) 58%, var(--bg));
+    }
+
+    .detail-row {
+      display: grid;
+      grid-template-columns: minmax(100px, 1fr) 132px 82px;
+      align-items: center;
+      gap: 10px;
+      min-height: 32px;
+      padding: 0 8px;
+      font-size: 12px;
+    }
+
+    .detail-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .empty {
+      padding: 42px 16px;
+      color: var(--text-muted);
+      text-align: center;
+    }
+
+    .footer {
+      color: var(--text-muted);
+      font-size: 11px;
+      text-align: right;
+    }
+
+    @media (max-width: 760px) {
+      .page {
+        width: min(100% - 20px, 1180px);
+        padding-top: 18px;
+      }
+
+      .page-header {
+        align-items: start;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .summary {
+        grid-template-columns: 1fr;
+      }
+
+      .metric {
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .metric:last-child {
+        border-bottom: 0;
+      }
+
+      .section {
+        padding-inline: 12px;
+      }
+
+      .usage-content {
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+
+      .usage-list {
+        width: 100%;
+      }
+
+      summary {
+        grid-template-columns: 14px 10px minmax(70px, 1fr) 76px 64px;
+        gap: 6px;
+      }
+
+      .detail-list {
+        padding-left: 24px;
+      }
+
+      .detail-row {
+        grid-template-columns: minmax(70px, 1fr) 98px 58px;
+        gap: 6px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="page-header">
+      <div>
+        <h1>行为轨迹</h1>
+        <p class="date" id="date"></p>
+      </div>
+      <span class="live" id="live"></span>
+    </header>
+
+    <p class="warning" id="warning"></p>
+
+    <section class="summary" aria-label="活动摘要">
+      <div class="metric">
+        <span class="metric-label">记录时长</span>
+        <strong class="metric-value" id="duration">0min</strong>
+      </div>
+      <div class="metric">
+        <span class="metric-label">活动记录</span>
+        <strong class="metric-value" id="event-count">0</strong>
+      </div>
+      <div class="metric">
+        <span class="metric-label">应用数量</span>
+        <strong class="metric-value" id="app-count">0</strong>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>行动轨迹</h2>
+      <div id="timeline"></div>
+    </section>
+
+    <section class="section">
+      <h2>应用使用占比</h2>
+      <div class="usage-content" id="usage"></div>
+    </section>
+
+    <p class="footer" id="generated-at"></p>
+  </main>
+
+  <script id="workdaily-data" type="application/json">{{WORKDAILY_DATA_JSON}}</script>
+  <script>
+    (function () {
+      "use strict";
+
+      var data = JSON.parse(document.getElementById("workdaily-data").textContent);
+      var palettes = [
+        { main: "#3478df", surface: "#dceaff", text: "#1455b8" },
+        { main: "#22a9a5", surface: "#d9f1ef", text: "#147d79" },
+        { main: "#7eb64d", surface: "#e5f1d9", text: "#527f2d" },
+        { main: "#9259e8", surface: "#eadffd", text: "#6d35c7" },
+        { main: "#d16b68", surface: "#f8e1df", text: "#a84542" },
+        { main: "#d49735", surface: "#f8ead2", text: "#99671b" }
+      ];
+      var idlePalette = { main: "#a6a6aa", surface: "#e6e6e8", text: "#66666c" };
+
+      function element(tag, className, text) {
+        var node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined && text !== null) node.textContent = String(text);
+        return node;
+      }
+
+      function clock(timestamp) {
+        return new Intl.DateTimeFormat("zh-CN", {
+          timeZone: data.timezone,
+          hour: "2-digit",
+          minute: "2-digit",
+          hourCycle: "h23"
+        }).format(new Date(timestamp * 1000));
+      }
+
+      function duration(milliseconds) {
+        var seconds = Math.round(milliseconds / 1000);
+        if (seconds < 60) return seconds + "s";
+        var minutes = Math.round(seconds / 60);
+        if (minutes < 60) return minutes + "min";
+        var hours = Math.floor(minutes / 60);
+        var rest = minutes % 60;
+        return rest ? hours + "h " + rest + "min" : hours + "h";
+      }
+
+      function percentage(value) {
+        return (value * 100).toFixed(2) + "%";
+      }
+
+      function stableHash(value) {
+        var hash = 0;
+        Array.from(value).forEach(function (character) {
+          hash = (hash * 31 + character.codePointAt(0)) >>> 0;
+        });
+        return hash;
+      }
+
+      function palette(key, app) {
+        if (key === "__system_idle__") return idlePalette;
+        var identity = (key + " " + app).toLowerCase();
+        if (identity.includes("xcode")) return palettes[0];
+        if (identity.includes("chatgpt") || identity.includes("openai")) return palettes[1];
+        if (identity.includes("wechat") || identity.includes("微信")) return palettes[2];
+        if (identity.includes("sourcetree")) return palettes[3];
+        return palettes[stableHash(key) % palettes.length];
+      }
+
+      function mixWithWhite(hex, ratio) {
+        var value = hex.replace("#", "");
+        var output = [0, 2, 4].map(function (offset) {
+          var channel = parseInt(value.slice(offset, offset + 2), 16);
+          return Math.round(channel + (255 - channel) * ratio)
+            .toString(16)
+            .padStart(2, "0");
+        });
+        return "#" + output.join("");
+      }
+
+      function shanghaiDayStart(date) {
+        return Date.parse(date + "T00:00:00+08:00") / 1000;
+      }
+
+      function renderHeader() {
+        document.getElementById("date").textContent = data.date;
+        document.getElementById("duration").textContent =
+          duration(data.totals.recorded_duration_ms);
+        document.getElementById("event-count").textContent = data.totals.event_count;
+        document.getElementById("app-count").textContent = data.totals.application_count;
+        var live = document.getElementById("live");
+        live.textContent = data.live ? "包含进行中活动" : "数据库快照";
+        if (!data.live) live.classList.add("offline");
+        if (data.warning) {
+          var warning = document.getElementById("warning");
+          warning.textContent = data.warning;
+          warning.style.display = "block";
+        }
+        document.getElementById("generated-at").textContent =
+          "生成时间：" + new Date(data.generated_at * 1000).toLocaleString("zh-CN", {
+            timeZone: data.timezone
+          });
+      }
+
+      function createAxis(startHour) {
+        var axis = element("div", "axis");
+        for (var index = 0; index < 7; index += 1) {
+          var hour = startHour + index * 2;
+          var tick = element("div", "axis-tick");
+          tick.style.left = (index / 6) * 100 + "%";
+          tick.appendChild(element("span", "", String(hour).padStart(2, "0") + ":00"));
+          axis.appendChild(tick);
+        }
+        return axis;
+      }
+
+      function renderRange(startHour) {
+        var dayStart = shanghaiDayStart(data.date);
+        var rangeStart = dayStart + startHour * 3600;
+        var rangeEnd = rangeStart + 12 * 3600;
+        var range = element("div", "range");
+        range.appendChild(
+          element(
+            "div",
+            "range-title",
+            String(startHour).padStart(2, "0") + ":00 – " +
+              String(startHour + 12).padStart(2, "0") + ":00"
+          )
+        );
+        range.appendChild(createAxis(startHour));
+        var track = element("div", "track");
+
+        data.activity_blocks.forEach(function (block) {
+          var start = Math.max(block.start_ts, rangeStart);
+          var end = Math.min(block.end_ts, rangeEnd);
+          if (end <= start) return;
+          var colors = palette(block.key, block.app);
+          var visibleTitles = block.titles.filter(function (title) {
+            return title.start_ts < end && title.end_ts > start;
+          });
+          var event = element("div", "event" + (visibleTitles.length > 1 ? "" : " single"));
+          event.style.left = ((start - rangeStart) / 43200) * 100 + "%";
+          event.style.width = ((end - start) / 43200) * 100 + "%";
+          event.style.borderColor = colors.main;
+          event.style.backgroundColor = colors.surface;
+          event.title =
+            block.app + "\n" + clock(start) + "–" + clock(end) + " · " +
+            duration((end - start) * 1000);
+
+          var app = element("div", "event-app", block.app);
+          app.style.color = colors.text;
+          event.appendChild(app);
+
+          if (visibleTitles.length > 1) {
+            var titleTrack = element("div", "title-track");
+            visibleTitles.forEach(function (title, index) {
+              var titleStart = Math.max(title.start_ts, start);
+              var titleEnd = Math.min(title.end_ts, end);
+              if (titleEnd <= titleStart) return;
+              var segment = element("div", "title-segment");
+              segment.style.left = ((titleStart - start) / (end - start)) * 100 + "%";
+              segment.style.width = ((titleEnd - titleStart) / (end - start)) * 100 + "%";
+              var ratio = [0.72, 0.18, 0.5, 0.32][index % 4];
+              segment.style.backgroundColor = mixWithWhite(colors.main, ratio);
+              segment.style.color = ratio >= 0.5 ? "#111827" : "#ffffff";
+              segment.title =
+                block.app + "\n" + (title.title || "(无标题)") + "\n" +
+                clock(titleStart) + "–" + clock(titleEnd) + " · " +
+                duration((titleEnd - titleStart) * 1000);
+              segment.appendChild(element("span", "", title.title || "(无标题)"));
+              titleTrack.appendChild(segment);
+            });
+            event.appendChild(titleTrack);
+          }
+          track.appendChild(event);
+        });
+        range.appendChild(track);
+        return range;
+      }
+
+      function renderTimeline() {
+        var timeline = document.getElementById("timeline");
+        if (!data.activity_blocks.length) {
+          timeline.appendChild(element("div", "empty", "当天暂无行为轨迹"));
+          return;
+        }
+        timeline.appendChild(renderRange(0));
+        timeline.appendChild(renderRange(12));
+      }
+
+      function renderUsage() {
+        var usage = document.getElementById("usage");
+        if (!data.usage.length) {
+          usage.appendChild(element("div", "empty", "当天暂无应用使用数据"));
+          return;
+        }
+        var stops = [];
+        var offset = 0;
+        data.usage.forEach(function (item) {
+          var colors = palette(item.key, item.app);
+          var end = offset + item.ratio * 100;
+          stops.push(colors.main + " " + offset + "% " + end + "%");
+          offset = end;
+        });
+        var donut = element("div", "donut");
+        donut.style.background = "conic-gradient(" + stops.join(", ") + ")";
+        donut.setAttribute("role", "img");
+        donut.setAttribute("aria-label", "应用使用时长占比");
+        usage.appendChild(donut);
+
+        var list = element("div", "usage-list");
+        data.usage.forEach(function (item) {
+          var colors = palette(item.key, item.app);
+          var details = element("details");
+          var summary = element("summary");
+          summary.appendChild(element("span", "chevron"));
+          var swatch = element("span", "swatch");
+          swatch.style.backgroundColor = colors.main;
+          summary.appendChild(swatch);
+          summary.appendChild(element("span", "app-name", item.app));
+          summary.appendChild(element("span", "number", duration(item.duration_ms)));
+          summary.appendChild(element("span", "number", percentage(item.ratio)));
+          details.appendChild(summary);
+
+          var detailList = element("div", "detail-list");
+          item.details.forEach(function (itemDetail) {
+            var row = element("div", "detail-row");
+            var title = element("span", "detail-title", itemDetail.title || "(无标题)");
+            title.title = itemDetail.title || "(无标题)";
+            row.appendChild(title);
+            row.appendChild(
+              element(
+                "span",
+                "number",
+                clock(itemDetail.start_ts) + "–" + clock(itemDetail.end_ts)
+              )
+            );
+            row.appendChild(element("span", "number", duration(itemDetail.duration_ms)));
+            detailList.appendChild(row);
+          });
+          details.appendChild(detailList);
+          list.appendChild(details);
+        });
+        usage.appendChild(list);
+      }
+
+      renderHeader();
+      renderTimeline();
+      renderUsage();
+    })();
+  </script>
+</body>
+</html>

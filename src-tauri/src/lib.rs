@@ -1,3 +1,4 @@
+mod cli_bridge;
 mod collector;
 mod generator;
 mod merger;
@@ -485,6 +486,12 @@ pub fn run() {
                 storage,
                 runtime_events: runtime_events.clone(),
             });
+
+            if let Err(error) =
+                cli_bridge::start(&data_dir, db_path.clone(), runtime_events.clone())
+            {
+                log::warn!("[cli] 本机查询通道未启动，桌面应用继续运行: {error}");
+            }
 
             // 启动采集后台任务（tokio 运行时由 tauri 管理）
             tauri::async_runtime::spawn(async move {

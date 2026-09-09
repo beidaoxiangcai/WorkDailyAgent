@@ -1,13 +1,22 @@
 {
-  "name": "work-daily-agent-frontend",
+  "name": "work-daily-agent",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.2.0",
   "type": "module",
+  "bin": {
+    "workdaily-agent": "skills/work-daily-agent/scripts/workdaily-agent.mjs"
+  },
+  "files": [
+    "skills"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "node --test tests/activity-analysis.test.ts",
+    "test": "node --test tests/activity-analysis.test.ts tests/workdaily-cli.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
